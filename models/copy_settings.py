@@ -86,3 +86,4 @@ class CopyTrade(Base):
     closed_at          = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="copy_trades")
+    
