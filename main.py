@@ -7,8 +7,9 @@ from routers import (
     analyst, scanner, smart_money,
     dashboard,
 )
+from routers import auth   # ← חדש
 
-app = FastAPI(title="Polymarket CopyTrade API", version="3.0.0")
+app = FastAPI(title="Polymarket CopyTrade API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Rate Limiting Middleware ----
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host
@@ -29,6 +29,7 @@ async def rate_limit_middleware(request: Request, call_next):
     return await call_next(request)
 
 # ---- Routers ----
+app.include_router(auth.router,             prefix="/api/auth",             tags=["Auth"])
 app.include_router(dashboard.router,        prefix="/api/dashboard",        tags=["Dashboard"])
 app.include_router(traders.router,          prefix="/api/traders",          tags=["Traders"])
 app.include_router(copy.router,             prefix="/api/copy",             tags=["Copy"])
@@ -54,4 +55,4 @@ async def shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.1.0", "auth": "enabled"}
