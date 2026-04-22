@@ -41,6 +41,7 @@ app.include_router(market_watchlist.router, prefix="/api/market-watchlist", tags
 app.include_router(analyst.router,          prefix="/api/analyst",          tags=["Market Analyst"])
 app.include_router(scanner.router,          prefix="/api/scanner",          tags=["Market Scanner"])
 app.include_router(smart_money.router,      prefix="/api/smart-money",      tags=["Smart Money"])
+app.include_router(copy_router.router,      prefix="/api/copy",             tags=["Copy Trading"])
 
 @app.on_event("startup")
 async def startup():
