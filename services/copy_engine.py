@@ -1,246 +1,242 @@
 """
-copy_engine.py — גרסה 2
-------------------------
-חידושים:
-1. כל קופי עובד עם ארנק Polygon נפרד שלו
-2. Take Profit אוטומטי פר עסקה (אופציונלי)
-3. Stop Loss אוטומטי פר עסקה (אופציונלי)
-4. מעקב PnL בזמן אמת לכל עסקה פתוחה
+copy_engine.py — Real Copy Trading Engine
+=========================================
+Polls Polymarket activity for watched traders,
+detects new trades, and mirrors them to user wallets.
+
+Flow:
+1. Every 10 seconds: fetch /activity?user={trader_addr}&limit=20
+2. Compare with last seen → find NEW trades
+3. For each new trade: calculate copy size per user settings
+4. Execute trade via Polymarket CLOB API
+5. Record in DB
 """
 
 import asyncio
+import httpx
+import json
+import time
 import logging
-from datetime import datetime, timezone
-
-from services.polymarket_service import get_trader_positions, get_market_price
-from services.trading_service import place_order
-from models.copy_settings import CopySettings, CopyTrade
-from db import get_db
+from datetime import datetime
+from typing import Optional
+from db import SessionLocal, engine
+from models import CopySetting, Wallet, Trade, CopyTrade
+from services.clob import CLOBClient
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL_SECONDS = 30   # בדיקת עסקאות חדשות של טריידרים
-PRICE_UPDATE_SECONDS  = 60   # עדכון מחיר + בדיקת TP/SL
-
+DATA_API = "https://data-api.polymarket.com"
+POLL_INTERVAL = 10  # seconds
 
 class CopyEngine:
     def __init__(self):
-        self._running = False
+        self.running = False
+        self._task: Optional[asyncio.Task] = None
+        # Track last seen trade timestamp per trader
+        self._last_seen: dict[str, int] = {}
 
     async def start(self):
-        self._running = True
-        logger.info("Copy engine v2 started")
-        asyncio.create_task(self._copy_loop())
-        asyncio.create_task(self._tp_sl_loop())
+        self.running = True
+        self._task = asyncio.create_task(self._loop())
+        logger.info("Copy engine started")
 
     async def stop(self):
-        self._running = False
+        self.running = False
+        if self._task:
+            self._task.cancel()
+        logger.info("Copy engine stopped")
 
-    # ------------------------------------------------------------------ #
-    #  לולאה 1 — מחפש עסקאות חדשות                                        #
-    # ------------------------------------------------------------------ #
-
-    async def _copy_loop(self):
-        while self._running:
+    async def _loop(self):
+        while self.running:
             try:
-                await self._process_all_copy_settings()
+                await self._tick()
             except Exception as e:
-                logger.error(f"copy_loop error: {e}")
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                logger.error(f"Copy engine tick error: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
 
-    async def _process_all_copy_settings(self):
-        db = next(get_db())
-        active = db.query(CopySettings).filter(CopySettings.is_active == True).all()
-
-        trader_map: dict[str, list] = {}
-        for s in active:
-            trader_map.setdefault(s.trader_address, []).append(s)
-
-        for trader_addr, settings_list in trader_map.items():
-            await self._check_trader(trader_addr, settings_list, db)
-
-    async def _check_trader(self, trader_addr: str, settings_list: list, db):
+    async def _tick(self):
+        """One polling cycle."""
+        db = SessionLocal()
         try:
-            positions = await get_trader_positions(trader_addr, closed=False)
-        except Exception as e:
-            logger.warning(f"fetch positions failed for {trader_addr}: {e}")
-            return
+            # Get all active copy settings
+            settings = db.query(CopySetting).filter(
+                CopySetting.is_active == True
+            ).all()
 
-        for setting in settings_list:
-            if not self._within_daily_limits(setting, db):
-                continue
-            for pos in positions:
-                trade_id = f"{trader_addr}:{pos.get('conditionId')}:{pos.get('side')}"
-                exists = db.query(CopyTrade).filter(
-                    CopyTrade.user_id == setting.user_id,
-                    CopyTrade.source_trade_id == trade_id,
-                ).first()
-                if not exists:
-                    await self._execute_copy_trade(setting, pos, trade_id, db)
-
-    async def _execute_copy_trade(self, setting, position: dict, trade_id: str, db):
-        price    = float(position.get("price", 0.5))
-        token_id = position.get("asset", "")
-        side     = position.get("side", "BUY")
-        size     = self._calculate_size(setting, price)
-
-        if size <= 0:
-            return
-
-        try:
-            result = place_order(
-                private_key=setting.decrypted_private_key,
-                funder_address=setting.copy_wallet_address,
-                token_id=token_id,
-                side=side,
-                price=price,
-                size=size,
-                is_demo=setting.is_demo,
-            )
-
-            trade = CopyTrade(
-                user_id=setting.user_id,
-                trader_address=setting.trader_address,
-                source_trade_id=trade_id,
-                token_id=token_id,
-                side=side,
-                price=price,
-                size=size,
-                cost_usdc=price * size,
-                is_demo=setting.is_demo,
-                order_id=result.get("order_id"),
-                status="open",
-                current_price=price,
-                pnl_usd=0.0,
-                pnl_pct=0.0,
-                opened_at=datetime.now(timezone.utc),
-                market_question=position.get("question", ""),
-                polymarket_url=f"https://polymarket.com/event/{position.get('slug', '')}",
-            )
-            db.add(trade)
-            db.commit()
-            logger.info(f"✅ Copied: user={setting.user_id} {side} {size}@{price}")
-
-        except Exception as e:
-            logger.error(f"execute_copy_trade failed: {e}")
-
-    # ------------------------------------------------------------------ #
-    #  לולאה 2 — עדכון מחירים + בדיקת Take Profit / Stop Loss              #
-    # ------------------------------------------------------------------ #
-
-    async def _tp_sl_loop(self):
-        while self._running:
-            try:
-                await self._check_tp_sl_all()
-            except Exception as e:
-                logger.error(f"tp_sl_loop error: {e}")
-            await asyncio.sleep(PRICE_UPDATE_SECONDS)
-
-    async def _check_tp_sl_all(self):
-        db = next(get_db())
-        open_trades = db.query(CopyTrade).filter(CopyTrade.status == "open").all()
-
-        for trade in open_trades:
-            setting = db.query(CopySettings).filter(
-                CopySettings.user_id == trade.user_id,
-                CopySettings.trader_address == trade.trader_address,
-            ).first()
-            if not setting:
-                continue
-
-            current_price = await get_market_price(trade.token_id)
-            if current_price is None:
-                continue
-
-            # חשב PnL
-            pnl_usd = (current_price - trade.price) * trade.size
-            pnl_pct = ((current_price - trade.price) / trade.price) * 100
-
-            trade.current_price = current_price
-            trade.pnl_usd       = round(pnl_usd, 4)
-            trade.pnl_pct       = round(pnl_pct, 2)
-
-            # ---- Take Profit ---- (אופציונלי — רק אם הוגדר)
-            if setting.take_profit_pct and pnl_pct >= setting.take_profit_pct:
-                logger.info(f"🟢 Take Profit: trade={trade.id} pnl={pnl_pct:.1f}%")
-                await self._close_trade(trade, setting, current_price, "take_profit", db)
-                continue
-
-            # ---- Stop Loss ---- (אופציונלי — רק אם הוגדר)
-            if setting.stop_loss_pct and pnl_pct <= -setting.stop_loss_pct:
-                logger.info(f"🔴 Stop Loss: trade={trade.id} pnl={pnl_pct:.1f}%")
-                await self._close_trade(trade, setting, current_price, "stop_loss", db)
-                continue
-
-            db.commit()
-
-    async def _close_trade(self, trade, setting, current_price: float, reason: str, db):
-        """מוכר עסקה — אמיתית או דמו."""
-        if not trade.is_demo:
-            try:
-                place_order(
-                    private_key=setting.decrypted_private_key,
-                    funder_address=setting.copy_wallet_address,
-                    token_id=trade.token_id,
-                    side="SELL",
-                    price=current_price,
-                    size=trade.size,
-                    is_demo=False,
-                )
-            except Exception as e:
-                logger.error(f"close_trade sell failed: {e}")
+            if not settings:
                 return
 
-        trade.status       = "closed"
-        trade.closed_price = current_price
-        trade.close_reason = reason
-        trade.closed_at    = datetime.now(timezone.utc)
-        db.commit()
+            # Get unique trader addresses to watch
+            traders = set(s.trader_address for s in settings)
 
-    # ------------------------------------------------------------------ #
-    #  פונקציות עזר                                                        #
-    # ------------------------------------------------------------------ #
+            async with httpx.AsyncClient(timeout=15) as client:
+                for trader_addr in traders:
+                    await self._check_trader(client, db, trader_addr, settings)
+        finally:
+            db.close()
 
-    def _calculate_size(self, setting, price: float) -> float:
-        balance = setting.live_usdc_balance
+    async def _check_trader(self, client, db, trader_addr: str, all_settings):
+        """Check a specific trader for new activity."""
+        try:
+            r = await client.get(
+                f"{DATA_API}/activity",
+                params={"user": trader_addr, "limit": 20},
+                headers={"Accept": "application/json"}
+            )
+            if not r.is_success:
+                return
 
-        if setting.mode == "fixed":
-            amount = min(setting.fixed_amount_usd, balance)
-        else:
-            amount = min(
-                balance * setting.percentage / 100,
-                setting.max_per_trade_usd,
-                balance,
+            trades = r.json()
+            if not trades or not isinstance(trades, list):
+                return
+
+            last_seen = self._last_seen.get(trader_addr, 0)
+            new_trades = []
+
+            for trade in trades:
+                ts = int(trade.get("timestamp", 0))
+                if ts > last_seen:
+                    new_trades.append(trade)
+
+            if not new_trades:
+                return
+
+            # Update last seen
+            self._last_seen[trader_addr] = max(
+                int(t.get("timestamp", 0)) for t in new_trades
             )
 
-        if amount <= 0 or price <= 0:
-            return 0.0
-        return round(amount / price, 2)
+            logger.info(f"Found {len(new_trades)} new trades from {trader_addr[:10]}...")
 
-    def _within_daily_limits(self, setting, db) -> bool:
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        today_trades = db.query(CopyTrade).filter(
-            CopyTrade.user_id == setting.user_id,
-            CopyTrade.trader_address == setting.trader_address,
-            CopyTrade.opened_at >= today_start,
-        ).all()
+            # Find copy settings that watch this trader
+            relevant = [s for s in all_settings if s.trader_address == trader_addr]
 
-        if setting.max_daily_trades and len(today_trades) >= setting.max_daily_trades:
-            return False
+            for trade in new_trades:
+                for setting in relevant:
+                    await self._mirror_trade(client, db, trade, setting)
 
-        if setting.max_daily_loss_usd:
-            daily_loss = sum(abs(t.pnl_usd or 0) for t in today_trades if (t.pnl_usd or 0) < 0)
-            if daily_loss >= setting.max_daily_loss_usd:
-                return False
+        except Exception as e:
+            logger.warning(f"Error checking trader {trader_addr[:10]}: {e}")
 
-        if setting.max_daily_profit_usd:
-            daily_profit = sum(t.pnl_usd or 0 for t in today_trades if (t.pnl_usd or 0) > 0)
-            if daily_profit >= setting.max_daily_profit_usd:
-                return False
+    async def _mirror_trade(self, client, db, trade: dict, setting):
+        """Mirror a single trade according to copy settings."""
+        try:
+            # Get user's wallet
+            db_temp = SessionLocal()
+            wallet = db_temp.query(Wallet).filter(
+                Wallet.id == setting.wallet_id,
+                Wallet.is_active == True
+            ).first()
+            db_temp.close()
 
-        return True
+            if not wallet or not wallet.private_key_encrypted:
+                return
 
+            # Parse trade details
+            condition_id = trade.get("conditionId", "")
+            side = trade.get("side", "").upper()  # BUY or SELL
+            token_id = trade.get("asset", "")
+            trader_size = float(trade.get("usdcSize", trade.get("size", 0)))
+            trader_price = float(trade.get("price", 0.5))
+
+            if not condition_id or not side or trader_size <= 0:
+                return
+
+            # Calculate copy size
+            copy_size = self._calc_size(trader_size, trader_price, setting)
+            if copy_size < 1.0:  # Min $1
+                logger.info(f"Copy size ${copy_size:.2f} too small, skipping")
+                return
+
+            # Check demo mode
+            if setting.is_demo:
+                await self._record_demo_trade(db, trade, setting, copy_size)
+                return
+
+            # Execute real trade via CLOB
+            clob = CLOBClient(wallet)
+            result = await clob.place_order(
+                token_id=token_id,
+                side=side,
+                size=copy_size,
+                price=trader_price,
+                condition_id=condition_id
+            )
+
+            if result.get("success"):
+                logger.info(f"✅ Copy trade executed: {side} ${copy_size:.2f} on {condition_id[:10]}")
+                await self._record_trade(db, trade, setting, copy_size, result)
+            else:
+                logger.warning(f"❌ Copy trade failed: {result.get('error')}")
+
+        except Exception as e:
+            logger.error(f"Mirror trade error: {e}")
+
+    def _calc_size(self, trader_size: float, price: float, setting) -> float:
+        """Calculate copy trade size based on settings."""
+        mode = setting.copy_mode  # 'mirror', 'fixed', 'percent'
+
+        if mode == "fixed":
+            return float(setting.fixed_amount or 10)
+
+        elif mode == "percent":
+            # % of trader's trade
+            pct = float(setting.copy_percent or 10) / 100
+            return trader_size * pct
+
+        elif mode == "mirror":
+            # Mirror exact ratio (trader_size / trader_portfolio * our_portfolio)
+            ratio = float(setting.mirror_ratio or 1.0)
+            return trader_size * ratio
+
+        return min(float(setting.max_trade or 50), trader_size)
+
+    async def _record_demo_trade(self, db, trade: dict, setting, size: float):
+        """Record a simulated copy trade for demo mode."""
+        try:
+            demo_trade = CopyTrade(
+                copy_setting_id=setting.id,
+                user_id=setting.user_id,
+                trader_address=setting.trader_address,
+                condition_id=trade.get("conditionId", ""),
+                side=trade.get("side", "").upper(),
+                size=size,
+                price=float(trade.get("price", 0)),
+                status="demo",
+                is_demo=True,
+                trader_tx=trade.get("transactionHash", ""),
+                market_title=trade.get("title", ""),
+                created_at=datetime.utcnow()
+            )
+            db.add(demo_trade)
+            db.commit()
+            logger.info(f"📝 Demo trade recorded: {size:.2f} USDC")
+        except Exception as e:
+            logger.error(f"Demo record error: {e}")
+            db.rollback()
+
+    async def _record_trade(self, db, trade: dict, setting, size: float, result: dict):
+        """Record a real executed copy trade."""
+        try:
+            copy_trade = CopyTrade(
+                copy_setting_id=setting.id,
+                user_id=setting.user_id,
+                trader_address=setting.trader_address,
+                condition_id=trade.get("conditionId", ""),
+                side=trade.get("side", "").upper(),
+                size=size,
+                price=float(trade.get("price", 0)),
+                status="executed",
+                is_demo=False,
+                trader_tx=trade.get("transactionHash", ""),
+                our_tx=result.get("transaction_hash", ""),
+                market_title=trade.get("title", ""),
+                created_at=datetime.utcnow()
+            )
+            db.add(copy_trade)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Trade record error: {e}")
+            db.rollback()
 
 copy_engine = CopyEngine()
