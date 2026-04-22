@@ -1,182 +1,217 @@
 """
-routers/copy.py — גרסה 2
--------------------------
-POST /api/copy/start        — התחל קופי (עם בחירת ארנק)
-POST /api/copy/stop/{id}    — עצור קופי
-POST /api/copy/resume/{id}  — חזור לקופי
-GET  /api/copy/settings/{user_id}
+routers/copy.py — Copy Trading API Endpoints
+=============================================
+Endpoints for managing copy settings and viewing copy history.
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
 from db import get_db
-from models.copy_settings import CopySettings, User
-from models.wallet import Wallet
-from sqlalchemy.orm import Session
-from datetime import datetime, timezone
+from models import CopySetting, CopyTrade, Wallet
+from routers.auth import get_current_user
+import httpx
 
 router = APIRouter()
 
+DATA_API = "https://data-api.polymarket.com"
 
-class StartCopyRequest(BaseModel):
-    user_id:              str
-    trader_address:       str
-    trader_name:          str
+# ── Request models ──────────────────────────────────────
 
-    # ---- בחירת ארנק ----
-    # אפשרות א: use_default_wallet=True → ישתמש בארנק ברירת המחדל
-    # אפשרות ב: wallet_id=<id> → ישתמש בארנק ספציפי קיים
-    # אפשרות ג: שניהם False/None → יצור ארנק חדש
-    use_default_wallet:   bool          = False
-    wallet_id:            Optional[int] = None    # ID של ארנק קיים
+class CopySettingCreate(BaseModel):
+    trader_address: str
+    wallet_id: int
+    copy_mode: str = "fixed"       # fixed | percent | mirror
+    fixed_amount: Optional[float] = 10.0
+    copy_percent: Optional[float] = 10.0
+    mirror_ratio: Optional[float] = 1.0
+    max_trade: Optional[float] = 100.0
+    max_daily: Optional[float] = 500.0
+    stop_loss: Optional[float] = None
+    is_demo: bool = True
+    is_active: bool = True
 
-    # ---- דמו ----
-    is_demo:              bool          = False
-    demo_balance_usd:     float         = 1000.0
+class CopySettingUpdate(BaseModel):
+    is_active: Optional[bool] = None
+    is_demo: Optional[bool] = None
+    fixed_amount: Optional[float] = None
+    copy_percent: Optional[float] = None
+    max_trade: Optional[float] = None
+    stop_loss: Optional[float] = None
 
-    # ---- הגדרות כניסה ----
-    mode:                 str           = "fixed"
-    fixed_amount_usd:     float         = 50.0
-    percentage:           float         = 5.0
-    max_per_trade_usd:    float         = 100.0
+# ── Endpoints ────────────────────────────────────────────
 
-    # ---- מגבלות יומיות (אופציונלי) ----
-    max_daily_trades:     Optional[int]   = None
-    max_daily_loss_usd:   Optional[float] = None
-    max_daily_profit_usd: Optional[float] = None
+@router.get("/settings")
+async def get_copy_settings(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Get all copy settings for current user."""
+    settings = db.query(CopySetting).filter(
+        CopySetting.user_id == user.id
+    ).all()
+    return settings
 
-    # ---- Take Profit / Stop Loss (אופציונלי) ----
-    take_profit_pct:      Optional[float] = None
-    stop_loss_pct:        Optional[float] = None
+@router.post("/settings")
+async def create_copy_setting(
+    data: CopySettingCreate,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Create a new copy trading configuration."""
+    # Verify wallet belongs to user
+    wallet = db.query(Wallet).filter(
+        Wallet.id == data.wallet_id,
+        Wallet.user_id == user.id
+    ).first()
+    if not wallet:
+        raise HTTPException(404, "Wallet not found")
 
-    # ---- מצב יציאה ----
-    sell_mode:            str           = "mirror"
-
-
-@router.post("/start")
-def start_copy(req: StartCopyRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == req.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    existing = db.query(CopySettings).filter(
-        CopySettings.user_id == req.user_id,
-        CopySettings.trader_address == req.trader_address,
-        CopySettings.is_active == True,
+    # Check for duplicate
+    existing = db.query(CopySetting).filter(
+        CopySetting.user_id == user.id,
+        CopySetting.trader_address == data.trader_address,
+        CopySetting.wallet_id == data.wallet_id,
+        CopySetting.is_active == True
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Already copying this trader")
+        raise HTTPException(400, "Already copying this trader")
 
-    # ---- בחירת / יצירת ארנק ----
-    private_key_backup = None   # מוחזר רק אם נוצר ארנק חדש
-
-    if req.use_default_wallet:
-        # השתמש בארנק ברירת המחדל הקיים
-        wallet = db.query(Wallet).filter(
-            Wallet.user_id == req.user_id,
-            Wallet.is_default == True,
-        ).first()
-        if not wallet:
-            raise HTTPException(
-                status_code=404,
-                detail="לא נמצא ארנק ברירת מחדל — צור ארנק ראשון"
-            )
-        wallet_address = wallet.address
-        wallet_encrypted_key = wallet.encrypted_private_key
-        wallet_label = wallet.label
-
-    elif req.wallet_id:
-        # השתמש בארנק ספציפי שנבחר
-        wallet = db.query(Wallet).filter(
-            Wallet.id == req.wallet_id,
-            Wallet.user_id == req.user_id,
-        ).first()
-        if not wallet:
-            raise HTTPException(status_code=404, detail="Wallet not found")
-        wallet_address = wallet.address
-        wallet_encrypted_key = wallet.encrypted_private_key
-        wallet_label = wallet.label
-
-    else:
-        # צור ארנק חדש ייעודי לקופי הזה
-        from services.wallet_service import create_wallet
-        new_w = create_wallet()
-        wallet_address = new_w["address"]
-        wallet_encrypted_key = new_w["encrypted_private_key"]
-        wallet_label = f"קופי — {req.trader_name}"
-        private_key_backup = new_w["private_key_plaintext"]
-
-        # שמור כארנק חדש ב-DB
-        new_wallet_row = Wallet(
-            user_id=req.user_id,
-            address=wallet_address,
-            encrypted_private_key=wallet_encrypted_key,
-            label=wallet_label,
-            is_default=False,
-        )
-        db.add(new_wallet_row)
-        db.flush()   # שמור לפני ה-commit כדי לקבל ID
-
-    setting = CopySettings(
-        user_id=req.user_id,
-        trader_address=req.trader_address,
-        trader_name=req.trader_name,
-        copy_wallet_address=wallet_address,
-        copy_wallet_encrypted_key=wallet_encrypted_key,
-        is_active=True,
-        is_demo=req.is_demo,
-        demo_balance_usd=req.demo_balance_usd,
-        mode=req.mode,
-        fixed_amount_usd=req.fixed_amount_usd,
-        percentage=req.percentage,
-        max_per_trade_usd=req.max_per_trade_usd,
-        max_daily_trades=req.max_daily_trades,
-        max_daily_loss_usd=req.max_daily_loss_usd,
-        max_daily_profit_usd=req.max_daily_profit_usd,
-        take_profit_pct=req.take_profit_pct,
-        stop_loss_pct=req.stop_loss_pct,
-        sell_mode=req.sell_mode,
+    setting = CopySetting(
+        user_id=user.id,
+        trader_address=data.trader_address,
+        wallet_id=data.wallet_id,
+        copy_mode=data.copy_mode,
+        fixed_amount=data.fixed_amount,
+        copy_percent=data.copy_percent,
+        mirror_ratio=data.mirror_ratio,
+        max_trade=data.max_trade,
+        max_daily=data.max_daily,
+        stop_loss=data.stop_loss,
+        is_demo=data.is_demo,
+        is_active=data.is_active
     )
     db.add(setting)
     db.commit()
     db.refresh(setting)
+    return setting
 
-    response = {
-        "status":         "started",
-        "copy_id":        setting.id,
-        "wallet_address": wallet_address,
-        "wallet_label":   wallet_label,
+@router.patch("/settings/{setting_id}")
+async def update_copy_setting(
+    setting_id: int,
+    data: CopySettingUpdate,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Update a copy setting."""
+    setting = db.query(CopySetting).filter(
+        CopySetting.id == setting_id,
+        CopySetting.user_id == user.id
+    ).first()
+    if not setting:
+        raise HTTPException(404, "Setting not found")
+
+    for field, value in data.dict(exclude_none=True).items():
+        setattr(setting, field, value)
+
+    db.commit()
+    return setting
+
+@router.delete("/settings/{setting_id}")
+async def delete_copy_setting(
+    setting_id: int,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Stop copying a trader."""
+    setting = db.query(CopySetting).filter(
+        CopySetting.id == setting_id,
+        CopySetting.user_id == user.id
+    ).first()
+    if not setting:
+        raise HTTPException(404, "Setting not found")
+    setting.is_active = False
+    db.commit()
+    return {"success": True}
+
+@router.get("/history")
+async def get_copy_history(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Get copy trade history."""
+    trades = db.query(CopyTrade).filter(
+        CopyTrade.user_id == user.id
+    ).order_by(CopyTrade.created_at.desc()).limit(limit).all()
+    return trades
+
+@router.get("/live/{trader_address}")
+async def get_trader_live_activity(trader_address: str):
+    """
+    Get LIVE recent activity of a specific trader.
+    Used by frontend to show what the trader is doing right now.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(
+                f"{DATA_API}/activity",
+                params={"user": trader_address, "limit": 20},
+                headers={"Accept": "application/json"}
+            )
+            if r.is_success:
+                return {"activity": r.json(), "trader": trader_address}
+            return {"activity": [], "trader": trader_address}
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+@router.get("/positions/{trader_address}")
+async def get_trader_positions(trader_address: str):
+    """Get current open positions of a trader."""
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(
+                f"{DATA_API}/positions",
+                params={"user": trader_address, "limit": 100, "closed": "false"},
+                headers={"Accept": "application/json"}
+            )
+            return r.json() if r.is_success else []
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+@router.get("/stats/{setting_id}")
+async def get_copy_stats(
+    setting_id: int,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Get performance stats for a copy setting."""
+    trades = db.query(CopyTrade).filter(
+        CopyTrade.copy_setting_id == setting_id,
+        CopyTrade.user_id == user.id
+    ).all()
+
+    total_trades = len(trades)
+    demo_trades = [t for t in trades if t.is_demo]
+    real_trades = [t for t in trades if not t.is_demo]
+
+    return {
+        "total_trades": total_trades,
+        "demo_trades": len(demo_trades),
+        "real_trades": len(real_trades),
+        "total_volume": sum(t.size for t in trades),
+        "trades": [
+            {
+                "id": t.id,
+                "side": t.side,
+                "size": t.size,
+                "price": t.price,
+                "market": t.market_title,
+                "status": t.status,
+                "is_demo": t.is_demo,
+                "created_at": t.created_at.isoformat() if t.created_at else None
+            }
+            for t in trades[-20:]  # Last 20
+        ]
     }
-
-    if private_key_backup:
-        response["private_key_backup"] = private_key_backup
-        response["warning"] = "⚠️ שמור את ה-private key! הוא לא יוצג שוב."
-        response["instructions"] = f"העבר USDC (Polygon) לכתובת {wallet_address} כדי להתחיל"
-
-    return response
-
-
-@router.post("/stop/{copy_id}")
-def stop_copy(copy_id: int, db: Session = Depends(get_db)):
-    s = db.query(CopySettings).filter(CopySettings.id == copy_id).first()
-    if not s:
-        raise HTTPException(status_code=404, detail="Copy setting not found")
-    s.is_active = False
-    db.commit()
-    return {"status": "stopped", "copy_id": copy_id}
-
-
-@router.post("/resume/{copy_id}")
-def resume_copy(copy_id: int, db: Session = Depends(get_db)):
-    s = db.query(CopySettings).filter(CopySettings.id == copy_id).first()
-    if not s:
-        raise HTTPException(status_code=404, detail="Copy setting not found")
-    s.is_active = True
-    db.commit()
-    return {"status": "resumed", "copy_id": copy_id}
-
-
-@router.get("/settings/{user_id}")
-def get_copy_settings(user_id: str, db: Session = Depends(get_db)):
-    return db.query(CopySettings).filter(CopySettings.user_id == user_id).all()
