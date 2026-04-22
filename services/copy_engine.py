@@ -1,11 +1,15 @@
 """
 services/copy_engine.py — Real Copy Trading Engine
-NO module-level model imports — everything lazy inside functions
+מותאם למבנה המודלים הקיים:
+  CopySettings (לא CopySetting)
+  CopyTrade עם שדות: user_id, copy_settings_id, trader_address,
+                      market_id, market_question, side, amount_usdc,
+                      price_entry, status, tx_hash
 """
 import asyncio
 import httpx
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -38,24 +42,24 @@ class CopyEngine:
             await asyncio.sleep(POLL_SECS)
 
     async def _tick(self):
-        # ALL imports inside function — never at module level
         try:
             from db import SessionLocal
-            from models.copy_settings import CopySetting
+            from models.copy_settings import CopySettings  # ← שם נכון
         except ImportError as e:
             logger.warning("DB/model not ready: %s", e)
             return
 
         db = SessionLocal()
         try:
-            settings = db.query(CopySetting).filter(
-                CopySetting.is_active == True
+            settings = db.query(CopySettings).filter(
+                CopySettings.is_active == True
             ).all()
 
             if not settings:
                 return
 
             traders = set(s.trader_address for s in settings)
+            logger.info("👁 Watching %d traders", len(traders))
 
             async with httpx.AsyncClient(timeout=15) as client:
                 for addr in traders:
@@ -89,7 +93,7 @@ class CopyEngine:
             self._last_ts[addr] = max(
                 int(t.get("timestamp", 0)) for t in new_trades
             )
-            logger.info("🔔 %d new trades from %s", len(new_trades), addr[:10])
+            logger.info("🔔 %d new trades from %s…", len(new_trades), addr[:10])
 
             relevant = [s for s in all_settings if s.trader_address == addr]
             for trade in new_trades:
@@ -101,107 +105,85 @@ class CopyEngine:
 
     async def _mirror(self, client, db, trade: dict, setting):
         try:
-            condition_id = trade.get("conditionId", "")
-            token_id     = trade.get("asset", "")
-            side         = (trade.get("side") or "").upper()
-            trader_size  = float(trade.get("usdcSize") or trade.get("size") or 0)
-            price        = float(trade.get("price") or 0.5)
-            market_title = trade.get("title") or trade.get("?title") or ""
+            # Parse trade from Polymarket activity endpoint
+            condition_id  = trade.get("conditionId", "")
+            token_id      = trade.get("asset", "")
+            side_raw      = (trade.get("side") or "").upper()  # BUY/SELL
+            trader_size   = float(trade.get("usdcSize") or trade.get("size") or 0)
+            price         = float(trade.get("price") or 0.5)
+            market_title  = trade.get("title") or trade.get("?title") or trade.get("market", "")
+            outcome_index = int(trade.get("outcomeIndex", 0))
 
-            if not condition_id or side not in ("BUY", "SELL") or trader_size <= 0:
+            # Convert BUY/SELL + outcomeIndex → YES/NO
+            # outcomeIndex 0 = YES, 1 = NO (Polymarket convention)
+            if side_raw == "BUY":
+                side = "YES" if outcome_index == 0 else "NO"
+            else:
+                side = "NO" if outcome_index == 0 else "YES"
+
+            if not condition_id or trader_size <= 0:
                 return
 
+            # Calculate copy size based on settings
             copy_size = self._calc_size(trader_size, setting)
             if copy_size < 1.0:
+                logger.info("Copy size $%.2f too small, skip", copy_size)
                 return
 
-            if setting.is_demo:
-                await self._save_demo(db, trade, setting,
-                                      copy_size, price, market_title)
-                return
+            logger.info("📋 Mirror: %s $%.2f on %s [demo=%s]",
+                        side, copy_size, market_title[:40], setting.is_active)
 
-            # Real trade via CLOB
-            try:
-                from models.wallet import Wallet
-                from services.clob import CLOBClient
+            # Save as demo trade (always first)
+            await self._save_trade(db, {
+                "user_id":          setting.user_id,
+                "copy_settings_id": setting.id,
+                "trader_address":   setting.trader_address,
+                "market_id":        condition_id,
+                "market_question":  market_title,
+                "side":             side,
+                "amount_usdc":      copy_size,
+                "price_entry":      price,
+                "status":           "demo",
+                "tx_hash":          trade.get("transactionHash", ""),
+            })
 
-                wallet = db.query(Wallet).filter(
-                    Wallet.id == setting.wallet_id,
-                    Wallet.is_active == True
-                ).first()
-                if not wallet:
-                    return
-
-                clob   = CLOBClient(wallet)
-                result = await clob.place_order(
-                    token_id, side, copy_size, price, condition_id
-                )
-                await self._save_real(db, trade, setting,
-                                      copy_size, price, market_title, result)
-            except ImportError as e:
-                logger.warning("CLOB not available: %s", e)
+            # TODO: Real execution via CLOB when wallet key is configured
+            # Uncomment when ready:
+            # wallet_addr = setting.wallet_address
+            # wallet_key  = setting.encrypted_wallet_key
+            # if wallet_key and not setting_is_demo(setting):
+            #     from services.clob import CLOBClient
+            #     clob = CLOBClient(wallet_addr, wallet_key)
+            #     result = await clob.place_order(token_id, side, copy_size, price)
 
         except Exception as e:
             logger.error("Mirror error: %s", e)
 
     def _calc_size(self, trader_size: float, setting) -> float:
-        mode = getattr(setting, "copy_mode", "fixed")
+        """Calculate copy trade size based on CopySettings fields."""
+        mode = getattr(setting, "entry_mode", "fixed")
         if mode == "percent":
-            pct = float(getattr(setting, "copy_percent", 10) or 10) / 100
+            pct = float(getattr(setting, "entry_amount", 10) or 10) / 100
             return trader_size * pct
-        elif mode == "mirror":
-            ratio = float(getattr(setting, "mirror_ratio", 1) or 1)
-            return trader_size * ratio
         # default: fixed
-        return float(getattr(setting, "fixed_amount", 10) or 10)
+        amount = float(getattr(setting, "entry_amount", 10) or 10)
+        # Respect max_daily_loss as max per trade if set
+        max_trade = getattr(setting, "max_daily_loss_usd", None)
+        if max_trade:
+            amount = min(amount, float(max_trade))
+        return amount
 
-    async def _save_demo(self, db, trade, setting,
-                         size, price, title):
+    async def _save_trade(self, db, data: dict):
         try:
-            from models.copy_trade import CopyTrade
-            db.add(CopyTrade(
-                copy_setting_id=setting.id,
-                user_id=setting.user_id,
-                trader_address=setting.trader_address,
-                condition_id=trade.get("conditionId", ""),
-                side=(trade.get("side") or "").upper(),
-                size=size, price=price,
-                status="demo", is_demo=True,
-                trader_tx=trade.get("transactionHash", ""),
-                market_title=title,
-            ))
+            from models.copy_settings import CopyTrade
+            trade = CopyTrade(**data)
+            db.add(trade)
             db.commit()
-            logger.info("📝 Demo: %s $%.2f | %s",
-                        (trade.get("side") or "").upper(), size, title[:30])
+            logger.info("💾 Saved trade: %s $%.2f [%s]",
+                        data.get("side"), data.get("amount_usdc", 0),
+                        data.get("status"))
         except Exception as e:
-            logger.error("Save demo error: %s", e)
-            db.rollback()
-
-    async def _save_real(self, db, trade, setting,
-                         size, price, title, result):
-        try:
-            from models.copy_trade import CopyTrade
-            status = "executed" if result.get("success") else "failed"
-            db.add(CopyTrade(
-                copy_setting_id=setting.id,
-                user_id=setting.user_id,
-                trader_address=setting.trader_address,
-                condition_id=trade.get("conditionId", ""),
-                side=(trade.get("side") or "").upper(),
-                size=size, price=price,
-                status=status, is_demo=False,
-                trader_tx=trade.get("transactionHash", ""),
-                our_tx=result.get("transaction_hash", ""),
-                market_title=title,
-                error_msg=result.get("error") if not result.get("success") else None,
-            ))
-            db.commit()
-            if result.get("success"):
-                logger.info("✅ Real copy: %s $%.2f", status, size)
-            else:
-                logger.warning("❌ Failed: %s", result.get("error"))
-        except Exception as e:
-            logger.error("Save real error: %s", e)
+            logger.error("Save trade error: %s", e)
             db.rollback()
 
 
