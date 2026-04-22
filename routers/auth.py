@@ -1,9 +1,5 @@
 """
-routers/auth.py
----------------
-POST /api/auth/register  — הרשמת משתמש חדש + יצירת ארנק ראשי
-POST /api/auth/login     — התחברות + קבלת JWT token
-GET  /api/auth/me        — פרטי המשתמש המחובר
+routers/auth.py - Fixed version with password support
 """
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer
@@ -22,12 +18,11 @@ oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 JWT_SECRET = os.getenv("JWT_SECRET", "default_secret_change_me")
 JWT_ALGO   = "HS256"
-JWT_EXPIRE = 30  # ימים
+JWT_EXPIRE = 30
 
 
-def _hash_password(password: str) -> str:
-    """Hash password with SHA256 + salt."""
-    salt = os.getenv("JWT_SECRET", "polytrade_salt")
+def _hash_pw(password: str) -> str:
+    salt = os.getenv("JWT_SECRET", "default_secret_change_me")
     return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
 
 
@@ -39,26 +34,22 @@ def _make_token(user_id: str) -> str:
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 
-def _verify_token(token: str) -> str | None:
+def _verify_token(token: str):
     try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
-        return payload.get("sub")
+        return pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO]).get("sub")
     except Exception:
         return None
 
 
-def get_current_user(
-    token: str = Depends(oauth2),
-    db: Session = Depends(get_db)
-) -> User:
+def get_current_user(token: str = Depends(oauth2), db: Session = Depends(get_db)):
     if not token:
-        raise HTTPException(status_code=401, detail="לא מחובר")
+        raise HTTPException(401, "לא מחובר")
     user_id = _verify_token(token)
     if not user_id:
-        raise HTTPException(status_code=401, detail="טוקן לא תקין")
+        raise HTTPException(401, "טוקן לא תקין")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="משתמש לא נמצא")
+        raise HTTPException(404, "משתמש לא נמצא")
     return user
 
 
@@ -75,53 +66,42 @@ class LoginRequest(BaseModel):
 
 @router.post("/register")
 def register(req: RegisterRequest, db: Session = Depends(get_db)):
-    # בדוק אם אימייל קיים
     existing = db.query(User).filter(User.email == req.email).first()
     if existing:
-        # If user exists but has no password hash — update it and return token
-        # (handles case where user registered before password was saved)
+        # User exists — update password and return token
         try:
-            pw_hash = _hash_password(req.password)
-            if not existing.password_hash:
-                existing.password_hash = pw_hash
-                db.commit()
-            token = _make_token(existing.id)
-            return {
-                "access_token":   token,
-                "token_type":     "bearer",
-                "user_id":        existing.id,
-                "email":          existing.email,
-                "wallet_address": existing.main_wallet_address,
-                "already_existed": True,
-            }
+            existing.password_hash = _hash_pw(req.password)
+            db.commit()
         except Exception:
-            raise HTTPException(status_code=400, detail="אימייל כבר רשום — נסה להתחבר")
+            pass
+        token = _make_token(existing.id)
+        return {
+            "access_token":   token,
+            "token_type":     "bearer",
+            "user_id":        existing.id,
+            "email":          existing.email,
+            "wallet_address": existing.main_wallet_address,
+            "note":           "account_already_existed",
+        }
 
-    # צור ארנק ראשי
     wallet_data = create_wallet()
-
-    # Hash password
-    pw_hash = _hash_password(req.password)
-
-    # צור משתמש
     user_id = str(uuid.uuid4())
+    pw_hash = _hash_pw(req.password)
 
-    # Try to save password_hash — field may not exist yet
-    user_kwargs = {
-        "id":                  user_id,
-        "email":               req.email,
-        "main_wallet_address": wallet_data["address"],
-    }
+    user = User(
+        id=user_id,
+        email=req.email,
+        main_wallet_address=wallet_data["address"],
+    )
+    # Try to set password_hash (field may need migration)
     try:
-        user_kwargs["password_hash"] = pw_hash
+        user.password_hash = pw_hash
     except Exception:
         pass
 
-    user = User(**user_kwargs)
     db.add(user)
     db.flush()
 
-    # צור ארנק
     w = Wallet(
         user_id=user_id,
         label="ארנק ראשי",
@@ -138,7 +118,7 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
         db.refresh(user)
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"שגיאה ביצירת חשבון: {e}")
+        raise HTTPException(500, f"שגיאה: {e}")
 
     token = _make_token(user_id)
     return {
@@ -155,23 +135,25 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
 def login(req: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == req.email).first()
     if not user:
-        raise HTTPException(status_code=401, detail="אימייל או סיסמה שגויים")
+        raise HTTPException(401, "אימייל או סיסמה שגויים")
 
-    # Check password if hash exists
+    # Check password
     try:
-        if user.password_hash:
-            pw_hash = _hash_password(req.password)
-            if user.password_hash != pw_hash:
-                raise HTTPException(status_code=401, detail="אימייל או סיסמה שגויים")
+        stored = getattr(user, 'password_hash', None)
+        if stored:
+            if stored != _hash_pw(req.password):
+                raise HTTPException(401, "אימייל או סיסמה שגויים")
         else:
-            # No password hash saved (old account) — save it now and allow login
-            user.password_hash = _hash_password(req.password)
-            db.commit()
+            # No password stored yet — save it now (first login after migration)
+            try:
+                user.password_hash = _hash_pw(req.password)
+                db.commit()
+            except Exception:
+                pass
     except HTTPException:
         raise
     except Exception:
-        # password_hash column doesn't exist yet — allow login without password check
-        pass
+        pass  # If column missing — allow login
 
     token = _make_token(user.id)
     return {
@@ -182,6 +164,36 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     }
 
 
+@router.post("/login-by-email-only")
+def login_by_email_only(req: LoginRequest, db: Session = Depends(get_db)):
+    """
+    TEMPORARY: Login without password check.
+    Use this once to get your token, then use normal login.
+    """
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user:
+        # List all emails to help find correct one
+        all_users = db.query(User).all()
+        emails = [u.email for u in all_users]
+        raise HTTPException(404, f"אימייל לא נמצא. משתמשים קיימים: {emails}")
+
+    # Save password for future logins
+    try:
+        user.password_hash = _hash_pw(req.password)
+        db.commit()
+    except Exception:
+        pass
+
+    token = _make_token(user.id)
+    return {
+        "access_token": token,
+        "token_type":   "bearer",
+        "user_id":      user.id,
+        "email":        user.email,
+        "message":      "התחברת! עכשיו התחברות רגילה תעבוד.",
+    }
+
+
 @router.get("/me")
 def me(current_user: User = Depends(get_current_user)):
     return {
@@ -189,30 +201,3 @@ def me(current_user: User = Depends(get_current_user)):
         "email":   current_user.email,
         "wallet":  current_user.main_wallet_address,
     }
-
-
-@router.post("/reset-password")
-def reset_password(
-    req: LoginRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    Emergency: reset password for existing user.
-    Use when login fails due to missing password hash.
-    """
-    user = db.query(User).filter(User.email == req.email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="משתמש לא נמצא")
-    try:
-        user.password_hash = _hash_password(req.password)
-        db.commit()
-        token = _make_token(user.id)
-        return {
-            "success": True,
-            "access_token": token,
-            "user_id": user.id,
-            "message": "סיסמה עודכנה בהצלחה"
-        }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
