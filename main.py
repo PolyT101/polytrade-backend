@@ -5,11 +5,11 @@ from routers import (
     traders, copy, portfolio, wallets,
     watchlist, market_watchlist,
     analyst, scanner, smart_money,
-    dashboard,
+    dashboard, auth,
 )
-from routers import auth   # ← חדש
+from routers import markets  # ← NEW proxy router
 
-app = FastAPI(title="Polymarket CopyTrade API", version="3.1.0")
+app = FastAPI(title="Polymarket CopyTrade API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,8 +28,9 @@ async def rate_limit_middleware(request: Request, call_next):
         return JSONResponse(status_code=429, content={"detail": str(e)})
     return await call_next(request)
 
-# ---- Routers ----
+# ── Routers ──────────────────────────────────────────────────────
 app.include_router(auth.router,             prefix="/api/auth",             tags=["Auth"])
+app.include_router(markets.router,          prefix="/api/pm",               tags=["Polymarket Proxy"])  # NEW
 app.include_router(dashboard.router,        prefix="/api/dashboard",        tags=["Dashboard"])
 app.include_router(traders.router,          prefix="/api/traders",          tags=["Traders"])
 app.include_router(copy.router,             prefix="/api/copy",             tags=["Copy"])
@@ -55,4 +56,4 @@ async def shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "3.1.0", "auth": "enabled"}
+    return {"status": "ok", "version": "3.2.0"}
