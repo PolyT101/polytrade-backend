@@ -10,13 +10,13 @@ class CopyTrade(Base):
 
     id              = Column(Integer, primary_key=True, index=True)
     copy_setting_id = Column(Integer, nullable=True)
-    user_id         = Column(Integer, ForeignKey("users.id"))
-    trader_address  = Column(String)
-    condition_id    = Column(String)
-    side            = Column(String)       # BUY / SELL
-    size            = Column(Float)        # גודל ב-USDC
-    price           = Column(Float)        # מחיר 0-1
-    status          = Column(String)       # demo / pending / executed / failed
+    user_id         = Column(Integer, nullable=True)
+    trader_address  = Column(String, nullable=True)
+    condition_id    = Column(String, nullable=True)
+    side            = Column(String, nullable=True)       # BUY / SELL
+    size            = Column(Float,  nullable=True)
+    price           = Column(Float,  nullable=True)
+    status          = Column(String, nullable=True)       # demo/pending/executed/failed
     is_demo         = Column(Boolean, default=True)
     trader_tx       = Column(String, nullable=True)
     our_tx          = Column(String, nullable=True)
