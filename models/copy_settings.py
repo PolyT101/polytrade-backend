@@ -17,6 +17,7 @@ class User(Base):
     id                    = Column(String, primary_key=True)
     email                 = Column(String, unique=True, nullable=True)
     main_wallet_address   = Column(String, unique=True, nullable=True)
+    password_hash         = Column(String, nullable=True)
     created_at            = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     # Relationships
