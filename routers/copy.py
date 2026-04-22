@@ -1,10 +1,8 @@
 """
-routers/copy.py — Copy Trading API Endpoints
-החלף את הקובץ הקיים בזה
+routers/copy.py — Copy Trading API
+מותאם למבנה המודלים הקיים
 """
-
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import httpx
@@ -13,189 +11,160 @@ router = APIRouter()
 
 DATA_API = "https://data-api.polymarket.com"
 
-# ── Import models dynamically to avoid import errors ──────────────
-def get_db():
-    from db import SessionLocal
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
-def get_current_user(token: str = None):
-    """Simplified auth - adapt to your existing auth system"""
-    from routers.auth import get_current_user as _get_user
-    return _get_user
+class CopySettingIn(BaseModel):
+    trader_address:   str
+    trader_name:      str = ""
+    wallet_address:   Optional[str] = None
+    entry_mode:       str   = "fixed"   # fixed | percent
+    entry_amount:     float = 50.0
+    take_profit_pct:  Optional[float] = None
+    stop_loss_pct:    Optional[float] = None
+    max_daily_trades: Optional[int]   = None
+    max_daily_loss_usd: Optional[float] = None
+    sell_mode:        str = "mirror"    # mirror | fixed | manual | sell_all
+    is_active:        bool = True
 
-# ── Pydantic models ───────────────────────────────────────────────
 
-class CopySettingCreate(BaseModel):
-    trader_address: str
-    wallet_id: int
-    copy_mode: str = "fixed"        # fixed | percent | mirror
-    fixed_amount: Optional[float]   = 10.0
-    copy_percent: Optional[float]   = 10.0
-    mirror_ratio: Optional[float]   = 1.0
-    max_trade: Optional[float]      = 100.0
-    max_daily: Optional[float]      = 500.0
-    stop_loss: Optional[float]      = None
-    is_demo: bool                   = True
-    is_active: bool                 = True
-
-class CopySettingUpdate(BaseModel):
-    is_active: Optional[bool]   = None
-    is_demo: Optional[bool]     = None
-    fixed_amount: Optional[float] = None
-    copy_percent: Optional[float] = None
-    max_trade: Optional[float]  = None
-    stop_loss: Optional[float]  = None
-
-# ── Helpers ───────────────────────────────────────────────────────
-
-def _get_copy_setting_model():
-    try:
-        from models.copy_settings import CopySetting
-        return CopySetting
-    except ImportError:
-        try:
-            from models import CopySetting
-            return CopySetting
-        except ImportError:
-            return None
-
-def _get_wallet_model():
-    try:
-        from models.wallet import Wallet
-        return Wallet
-    except ImportError:
-        try:
-            from models import Wallet
-            return Wallet
-        except ImportError:
-            return None
-
-# ── Endpoints ─────────────────────────────────────────────────────
+# ── /settings ────────────────────────────────────────────────────
 
 @router.get("/settings")
-async def get_copy_settings(
-    user_id: int = 1,   # TODO: replace with real auth
-    db: Session = Depends(get_db)
-):
-    """Get all copy settings for user."""
-    CopySetting = _get_copy_setting_model()
-    if not CopySetting:
+async def get_settings(user_id: str = "1"):
+    try:
+        from db import SessionLocal
+        from models.copy_settings import CopySettings
+        db = SessionLocal()
+        try:
+            rows = db.query(CopySettings).filter(
+                CopySettings.user_id == user_id,
+                CopySettings.is_active == True
+            ).all()
+            return [_fmt_setting(r) for r in rows]
+        finally:
+            db.close()
+    except Exception as e:
         return []
-    return db.query(CopySetting).filter(
-        CopySetting.user_id == user_id
-    ).all()
+
 
 @router.post("/settings")
-async def create_copy_setting(
-    data: CopySettingCreate,
-    user_id: int = 1,
-    db: Session = Depends(get_db)
-):
-    """Create a new copy trading configuration."""
-    CopySetting = _get_copy_setting_model()
-    Wallet = _get_wallet_model()
+async def create_setting(data: CopySettingIn, user_id: str = "1"):
+    try:
+        from db import SessionLocal
+        from models.copy_settings import CopySettings
+        db = SessionLocal()
+        try:
+            # Check duplicate
+            existing = db.query(CopySettings).filter(
+                CopySettings.user_id == user_id,
+                CopySettings.trader_address == data.trader_address,
+                CopySettings.is_active == True
+            ).first()
+            if existing:
+                raise HTTPException(400, "כבר עושה קופי לטריידר זה")
 
-    if Wallet:
-        wallet = db.query(Wallet).filter(
-            Wallet.id == data.wallet_id
-        ).first()
-        if not wallet:
-            raise HTTPException(404, "Wallet not found")
+            s = CopySettings(
+                user_id=user_id,
+                trader_address=data.trader_address,
+                trader_name=data.trader_name,
+                wallet_address=data.wallet_address,
+                entry_mode=data.entry_mode,
+                entry_amount=data.entry_amount,
+                take_profit_pct=data.take_profit_pct,
+                stop_loss_pct=data.stop_loss_pct,
+                max_daily_trades=data.max_daily_trades,
+                max_daily_loss_usd=data.max_daily_loss_usd,
+                sell_mode=data.sell_mode,
+                is_active=data.is_active,
+            )
+            db.add(s)
+            db.commit()
+            db.refresh(s)
+            return _fmt_setting(s)
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
-    if CopySetting:
-        setting = CopySetting(
-            user_id=user_id,
-            trader_address=data.trader_address,
-            wallet_id=data.wallet_id,
-            copy_mode=data.copy_mode,
-            fixed_amount=data.fixed_amount,
-            copy_percent=data.copy_percent,
-            max_trade=data.max_trade,
-            max_daily=data.max_daily,
-            stop_loss=data.stop_loss,
-            is_demo=data.is_demo,
-            is_active=data.is_active
-        )
-        db.add(setting)
-        db.commit()
-        db.refresh(setting)
-        return setting
-
-    return {"success": True, "trader_address": data.trader_address}
-
-@router.patch("/settings/{setting_id}")
-async def update_copy_setting(
-    setting_id: int,
-    data: CopySettingUpdate,
-    db: Session = Depends(get_db)
-):
-    CopySetting = _get_copy_setting_model()
-    if not CopySetting:
-        raise HTTPException(404, "Model not available")
-    setting = db.query(CopySetting).filter(CopySetting.id == setting_id).first()
-    if not setting:
-        raise HTTPException(404, "Setting not found")
-    for field, value in data.dict(exclude_none=True).items():
-        setattr(setting, field, value)
-    db.commit()
-    return setting
 
 @router.delete("/settings/{setting_id}")
-async def delete_copy_setting(
-    setting_id: int,
-    db: Session = Depends(get_db)
-):
-    CopySetting = _get_copy_setting_model()
-    if CopySetting:
-        setting = db.query(CopySetting).filter(CopySetting.id == setting_id).first()
-        if setting:
-            setting.is_active = False
+async def stop_copy(setting_id: int, user_id: str = "1"):
+    try:
+        from db import SessionLocal
+        from models.copy_settings import CopySettings
+        db = SessionLocal()
+        try:
+            s = db.query(CopySettings).filter(
+                CopySettings.id == setting_id,
+                CopySettings.user_id == user_id
+            ).first()
+            if not s:
+                raise HTTPException(404, "לא נמצא")
+            s.is_active = False
             db.commit()
-    return {"success": True}
+            return {"success": True}
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── /history ─────────────────────────────────────────────────────
 
 @router.get("/history")
-async def get_copy_history(
-    user_id: int = 1,
-    limit: int = 50,
-    db: Session = Depends(get_db)
-):
-    """Get copy trade history."""
+async def get_history(user_id: str = "1", limit: int = 50):
     try:
-        # Try to import CopyTrade model
+        from db import SessionLocal
+        from models.copy_settings import CopyTrade
+        db = SessionLocal()
         try:
-            from models.copy_trade import CopyTrade
-        except ImportError:
-            return []  # Table doesn't exist yet
-        trades = db.query(CopyTrade).filter(
-            CopyTrade.user_id == user_id
-        ).order_by(CopyTrade.created_at.desc()).limit(limit).all()
-        return [
-            {
-                "id": t.id,
-                "side": t.side,
-                "size": t.size,
-                "price": t.price,
-                "market": t.market_title,
-                "status": t.status,
-                "is_demo": t.is_demo,
-                "trader": t.trader_address,
-                "created_at": str(t.created_at) if t.created_at else None
-            }
-            for t in trades
-        ]
-    except Exception:
+            trades = db.query(CopyTrade).filter(
+                CopyTrade.user_id == user_id
+            ).order_by(CopyTrade.opened_at.desc()).limit(limit).all()
+            return [_fmt_trade(t) for t in trades]
+        finally:
+            db.close()
+    except Exception as e:
         return []
+
+
+@router.get("/stats")
+async def get_stats(user_id: str = "1"):
+    try:
+        from db import SessionLocal
+        from models.copy_settings import CopyTrade
+        db = SessionLocal()
+        try:
+            trades = db.query(CopyTrade).filter(
+                CopyTrade.user_id == user_id
+            ).all()
+            open_t   = [t for t in trades if t.status == "open"]
+            closed_t = [t for t in trades if t.status == "closed"]
+            demo_t   = [t for t in trades if t.status == "demo"]
+            total_pnl = sum(t.pnl_usd or 0 for t in closed_t)
+            return {
+                "total": len(trades),
+                "open": len(open_t),
+                "closed": len(closed_t),
+                "demo": len(demo_t),
+                "total_pnl": round(total_pnl, 2),
+                "total_volume": round(sum(t.amount_usdc or 0 for t in trades), 2),
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        return {"total": 0, "open": 0, "closed": 0, "demo": 0,
+                "total_pnl": 0, "total_volume": 0}
+
+
+# ── Live data from Polymarket ────────────────────────────────────
 
 @router.get("/live/{trader_address}")
 async def get_trader_live(trader_address: str):
-    """
-    Get LIVE recent activity of a trader from Polymarket.
-    This is what the copy engine monitors.
-    """
+    """פעילות אחרונה של טריידר — בזמן אמת מ-Polymarket."""
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             r = await client.get(
@@ -203,15 +172,17 @@ async def get_trader_live(trader_address: str):
                 params={"user": trader_address, "limit": 20},
                 headers={"Accept": "application/json"}
             )
-            if r.is_success:
-                return {"activity": r.json(), "trader": trader_address}
-            return {"activity": [], "trader": trader_address, "error": r.text}
+            return {
+                "activity": r.json() if r.is_success else [],
+                "trader": trader_address
+            }
     except Exception as e:
         raise HTTPException(502, str(e))
 
+
 @router.get("/positions/{trader_address}")
 async def get_trader_positions(trader_address: str):
-    """Get current open positions of a trader."""
+    """פוזיציות פתוחות של טריידר."""
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             r = await client.get(
@@ -223,17 +194,38 @@ async def get_trader_positions(trader_address: str):
     except Exception as e:
         raise HTTPException(502, str(e))
 
-@router.get("/stats")
-async def get_copy_stats(user_id: int = 1, db: Session = Depends(get_db)):
-    """Get overall copy trading stats."""
-    try:
-        from models.copy_trade import CopyTrade
-        trades = db.query(CopyTrade).filter(CopyTrade.user_id == user_id).all()
-        return {
-            "total": len(trades),
-            "demo": len([t for t in trades if t.is_demo]),
-            "real": len([t for t in trades if not t.is_demo]),
-            "volume": sum(t.size for t in trades)
-        }
-    except Exception:
-        return {"total": 0, "demo": 0, "real": 0, "volume": 0}
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _fmt_setting(s) -> dict:
+    return {
+        "id":               s.id,
+        "trader_address":   s.trader_address,
+        "trader_name":      s.trader_name,
+        "entry_mode":       s.entry_mode,
+        "entry_amount":     s.entry_amount,
+        "take_profit_pct":  s.take_profit_pct,
+        "stop_loss_pct":    s.stop_loss_pct,
+        "max_daily_trades": s.max_daily_trades,
+        "max_daily_loss":   s.max_daily_loss_usd,
+        "sell_mode":        s.sell_mode,
+        "is_active":        s.is_active,
+        "created_at":       str(s.created_at) if s.created_at else None,
+    }
+
+def _fmt_trade(t) -> dict:
+    return {
+        "id":            t.id,
+        "trader":        t.trader_address,
+        "market":        t.market_question,
+        "market_id":     t.market_id,
+        "side":          t.side,
+        "amount":        t.amount_usdc,
+        "price_entry":   t.price_entry,
+        "price_exit":    t.price_exit,
+        "pnl":           t.pnl_usd,
+        "status":        t.status,
+        "tx_hash":       t.tx_hash,
+        "opened_at":     str(t.opened_at) if t.opened_at else None,
+        "closed_at":     str(t.closed_at) if t.closed_at else None,
+    }
