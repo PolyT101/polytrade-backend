@@ -8,6 +8,7 @@ Copy Engine עם:
 - מחירים בזמן אמת כל 30 שניות
 """
 import asyncio
+from typing import Optional
 import httpx
 import logging
 from datetime import datetime, timezone, date
@@ -401,7 +402,5 @@ class CopyEngine:
             return True
 
 
-# טיפוס Optional חסר
-from typing import Optional
 
 copy_engine = CopyEngine()
