@@ -56,4 +56,4 @@ async def shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "3.2.0"}
+    return {"status": "ok", "version": "3.2.1"}
