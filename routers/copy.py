@@ -114,6 +114,30 @@ async def stop_copy(setting_id: int, user_id: str = "1"):
         db.close()
 
 
+@router.post("/settings/{setting_id}/activate")
+async def resume_copy(setting_id: int, user_id: str = "1"):
+    """הפעלה מחדש של קופי שהופסק."""
+    from db import SessionLocal
+    from models.copy_settings import CopySettings
+    db = SessionLocal()
+    try:
+        s = db.query(CopySettings).filter(
+            CopySettings.id == setting_id,
+            CopySettings.user_id == user_id
+        ).first()
+        if not s:
+            raise HTTPException(404, "לא נמצא")
+        s.is_active = True
+        db.commit()
+        return {"success": True, "setting_id": setting_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
 @router.get("/history")
 async def get_history(user_id: str = "1", limit: int = 200):
     from db import SessionLocal
