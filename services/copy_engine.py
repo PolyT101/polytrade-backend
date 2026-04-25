@@ -148,6 +148,17 @@ class CopyEngine:
             token_id      = trade.get("asset") or ""   # token_id for live price
             trader_tx     = trade.get("transactionHash", "")
             trade_type = (trade.get("type") or "TRADE").upper()
+
+            # MERGE = convert YES+NO→USDC, REDEEM = claim resolved market winnings
+            # Both mean the trader is exiting — mirror sell our open position
+            if trade_type in ("MERGE", "REDEEM"):
+                if condition_id:
+                    sell_mode = getattr(setting, "sell_mode", "mirror")
+                    if sell_mode in ("mirror", "sell_all"):
+                        exit_price = price if price > 0 else 1.0
+                        await self._mirror_sell(db, setting, condition_id, exit_price)
+                return
+
             if trade_type != "TRADE":
                 return
             if not condition_id or trader_size <= 0:
