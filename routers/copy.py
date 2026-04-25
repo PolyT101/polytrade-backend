@@ -210,6 +210,36 @@ async def get_stats(user_id: str = "1"):
         db.close()
 
 
+@router.post("/cleanup-duplicates")
+async def cleanup_duplicates(user_id: str = "1"):
+    """מחק duplicate demo trades — שמור רק את הראשון לכל tx_hash לכל setting."""
+    from db import SessionLocal
+    from models.copy_settings import CopyTrade
+    db = SessionLocal()
+    try:
+        trades = db.query(CopyTrade).filter(
+            CopyTrade.user_id == user_id,
+            CopyTrade.status == "demo",
+        ).order_by(CopyTrade.id.asc()).all()
+
+        seen = set()
+        deleted = 0
+        for t in trades:
+            key = (t.tx_hash or str(t.id), t.copy_settings_id)
+            if t.tx_hash and key in seen:
+                db.delete(t)
+                deleted += 1
+            else:
+                seen.add(key)
+        db.commit()
+        return {"deleted": deleted, "remaining": len(trades) - deleted}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
 @router.get("/live/{trader_address}")
 async def get_trader_live(trader_address: str):
     try:
