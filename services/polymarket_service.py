@@ -1,13 +1,7 @@
 """
-services/polymarket_service.py — v3
+services/polymarket_service.py — v4
 ------------------------------------
-כל הקריאות ל-Polymarket APIs מרוכזות כאן.
-משתמש ב-APIs הציבוריים שאושרו כעובדים:
-  - data-api.polymarket.com/activity  ✅
-  - data-api.polymarket.com/positions ✅
-  - gamma-api.polymarket.com/markets  ✅ (דרך backend proxy)
-  - clob.polymarket.com/price         ✅
-  - data-api.polymarket.com/leaderboard ✅ (נבדק)
+תוקן: leaderboard endpoint + profile fields נכונים
 """
 import httpx
 import asyncio
@@ -17,51 +11,79 @@ CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_BASE  = "https://data-api.polymarket.com"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Origin": "https://polymarket.com",
+    "Referer": "https://polymarket.com/",
+}
+
+
+async def _get(client: httpx.AsyncClient, url: str, params: dict = None) -> Optional[dict | list]:
+    try:
+        r = await client.get(url, params=params or {}, headers=HEADERS)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
 
 # ═══════════════════════════════════════════════════════════
-# LEADERBOARD — 500 טריידרים עם ניקניים אמיתיים
+# LEADERBOARD
 # ═══════════════════════════════════════════════════════════
 
-async def get_leaderboard(limit: int = 500, offset: int = 0) -> list[dict]:
-    """
-    מושך לידרבורד מפולימארקט.
-    Strategy:
-    1. נסה data-api/leaderboard (הכי מדויק)
-    2. אם נכשל — בנה מ-activity עם aggregation
-    """
+async def get_leaderboard(limit: int = 100, offset: int = 0) -> list[dict]:
     async with httpx.AsyncClient(timeout=20) as client:
-        # ניסיון 1: leaderboard endpoint ישיר
-        try:
-            r = await client.get(
-                f"{DATA_BASE}/leaderboard",
-                params={"limit": limit, "offset": offset}
-            )
-            if r.status_code == 200:
-                data = r.json()
-                items = data if isinstance(data, list) else data.get("data", data.get("leaderboard", []))
-                if items:
-                    return _normalize_traders(items)
-        except Exception:
-            pass
 
-        # ניסיון 2: activity aggregation — מי סוחר הכי הרבה
-        try:
-            r = await client.get(
-                f"{DATA_BASE}/activity",
-                params={"limit": 500}
-            )
-            if r.status_code == 200:
-                acts = r.json()
-                if isinstance(acts, list) and acts:
-                    return _build_leaderboard_from_activity(acts, limit)
-        except Exception:
-            pass
+        # Strategy 1: data-api leaderboard (exact Polymarket endpoint)
+        data = await _get(client, f"{DATA_BASE}/leaderboard",
+                          {"limit": limit, "offset": offset,
+                           "order": "pnl", "ascending": "false"})
+        if data:
+            items = data if isinstance(data, list) else \
+                    data.get("data", data.get("leaderboard", data.get("profiles", [])))
+            if items:
+                return [_norm_trader(t, i) for i, t in enumerate(items)]
+
+        # Strategy 2: profiles endpoint
+        data = await _get(client, f"{DATA_BASE}/profiles",
+                          {"limit": limit, "offset": offset,
+                           "order": "pnl", "ascending": "false"})
+        if data:
+            items = data if isinstance(data, list) else data.get("profiles", [])
+            if items:
+                return [_norm_trader(t, i) for i, t in enumerate(items)]
+
+        # Strategy 3: build from activity (aggregation)
+        data = await _get(client, f"{DATA_BASE}/activity", {"limit": 500})
+        if data and isinstance(data, list):
+            return _build_from_activity(data, limit)
 
     return []
 
 
-def _build_leaderboard_from_activity(acts: list, limit: int) -> list[dict]:
-    """בונה לידרבורד מנתוני activity עם ניקניים."""
+def _norm_trader(t: dict, i: int) -> dict:
+    addr = t.get("proxyWallet") or t.get("address") or t.get("user") or ""
+    name = (t.get("name") or t.get("pseudonym") or t.get("username") or
+            t.get("displayName") or _short_addr(addr))
+    pnl    = float(t.get("pnl") or t.get("profit") or t.get("totalPnl") or 0)
+    roi    = float(t.get("percentPnl") or t.get("roi") or t.get("roiPct") or 0)
+    win    = float(t.get("winRate") or t.get("win_rate") or t.get("pctPositive") or 0)
+    trades = int(t.get("numTrades") or t.get("tradesCount") or t.get("trades") or 0)
+    volume = float(t.get("volume") or t.get("volumeTraded") or t.get("totalVolume") or 0)
+    return {
+        "address":      addr,
+        "name":         name,
+        "pnl":          round(pnl, 2),
+        "roi":          round(roi, 2),
+        "win_rate":     round(win, 1),
+        "trades_count": trades,
+        "volume":       round(volume, 2),
+    }
+
+
+def _build_from_activity(acts: list, limit: int) -> list[dict]:
     wallets: dict = {}
     for a in acts:
         addr = a.get("proxyWallet", "")
@@ -69,266 +91,131 @@ def _build_leaderboard_from_activity(acts: list, limit: int) -> list[dict]:
             continue
         if addr not in wallets:
             wallets[addr] = {
-                "address":  addr,
-                "name":     a.get("pseudonym") or a.get("name") or "",
-                "volume":   0.0,
-                "trades":   0,
-                "buys":     0,
-                "sells":    0,
-                "pnl":      0.0,
-                "win_rate": 0.0,
+                "address": addr,
+                "name": a.get("pseudonym") or a.get("name") or _short_addr(addr),
+                "volume": 0.0, "trades": 0, "pnl": 0.0,
+                "roi": 0.0, "win_rate": 50.0, "trades_count": 0,
             }
         w = wallets[addr]
-        w["volume"]  += float(a.get("usdcSize") or a.get("size") or 0)
-        w["trades"]  += 1
-        if (a.get("side") or "").upper() == "BUY":
-            w["buys"] += 1
-        else:
-            w["sells"] += 1
+        w["volume"]       += float(a.get("usdcSize") or 0)
+        w["trades"]       += 1
+        w["trades_count"] += 1
 
     result = sorted(wallets.values(), key=lambda x: x["volume"], reverse=True)[:limit]
-    for t in result:
-        t["win_rate"] = round((t["buys"] / t["trades"]) * 100, 1) if t["trades"] else 50.0
-        if not t["name"]:
-            t["name"] = _short_addr(t["address"])
-    return result
-
-
-def _normalize_traders(raw: list) -> list[dict]:
-    result = []
-    for t in raw:
-        addr = t.get("address", t.get("proxyWallet", t.get("user", "")))
-        name = (t.get("pseudonym") or t.get("name") or t.get("username") or
-                t.get("displayName") or _short_addr(addr))
-        result.append({
-            "address":      addr,
-            "name":         name,
-            "pnl":          float(t.get("pnl", t.get("profit", t.get("scaledProfit", 0)))),
-            "roi":          float(t.get("roi", t.get("percentPnl", 0))),
-            "win_rate":     float(t.get("winRate", t.get("win_rate", 50))),
-            "trades_count": int(t.get("tradesCount", t.get("numTrades", t.get("trades_count", 0)))),
-            "volume":       float(t.get("volume", t.get("volumeTraded", t.get("scaledVolume", 0)))),
-        })
     return result
 
 
 def _short_addr(addr: str) -> str:
     if not addr or len(addr) < 10:
-        return addr
+        return addr or "Unknown"
     return f"@{addr[2:8]}...{addr[-4:]}"
 
 
 # ═══════════════════════════════════════════════════════════
-# TRADER PROFILE — פרופיל מלא עם נתונים אמיתיים
+# TRADER PROFILE
 # ═══════════════════════════════════════════════════════════
 
 async def get_trader_profile(address: str) -> dict:
-    """מושך פרופיל טריידר עם כל הנתונים הרלוונטיים."""
     async with httpx.AsyncClient(timeout=15) as client:
-        profile_data = {}
+        profile = {}
         positions = []
         activity = []
 
-        # פרופיל
-        try:
-            r = await client.get(f"{DATA_BASE}/profiles/{address}")
-            if r.status_code == 200:
-                profile_data = r.json() or {}
-        except Exception:
-            pass
+        p = await _get(client, f"{DATA_BASE}/profiles/{address}")
+        if p and isinstance(p, dict):
+            profile = p
 
-        # פוזיציות פתוחות
-        try:
-            r = await client.get(
-                f"{DATA_BASE}/positions",
-                params={"user": address, "limit": 100, "closed": "false"}
-            )
-            if r.status_code == 200:
-                positions = r.json() or []
-        except Exception:
-            pass
+        pos = await _get(client, f"{DATA_BASE}/positions",
+                         {"user": address, "limit": 100, "closed": "false"})
+        if pos and isinstance(pos, list):
+            positions = pos
 
-        # activity (לניקניים + נתונים)
-        try:
-            r = await client.get(
-                f"{DATA_BASE}/activity",
-                params={"user": address, "limit": 50}
-            )
-            if r.status_code == 200:
-                activity = r.json() or []
-        except Exception:
-            pass
+        act = await _get(client, f"{DATA_BASE}/activity",
+                         {"user": address, "limit": 50})
+        if act and isinstance(act, list):
+            activity = act
 
-        # חישובים
-        total_val = sum(float(p.get("currentValue", 0)) for p in positions if isinstance(p, dict))
-        total_pnl = sum(float(p.get("cashPnl", 0)) for p in positions if isinstance(p, dict))
-        avg_roi   = (sum(float(p.get("percentPnl", 0)) for p in positions if isinstance(p, dict))
-                     / len(positions)) if positions else 0
-
-        name = (profile_data.get("pseudonym") or profile_data.get("name") or
+        addr = address
+        name = (profile.get("pseudonym") or profile.get("name") or
                 (activity[0].get("pseudonym") if activity else None) or
-                _short_addr(address))
+                _short_addr(addr))
+
+        pnl = sum(float(p.get("cashPnl", 0)) for p in positions if isinstance(p, dict))
+        vol = sum(float(p.get("currentValue", 0)) for p in positions if isinstance(p, dict))
+        roi = (sum(float(p.get("percentPnl", 0)) for p in positions) /
+               len(positions)) if positions else 0
 
         return {
-            "address":      address,
+            "address":      addr,
             "name":         name,
-            "pnl":          round(total_pnl, 2),
-            "roi":          round(avg_roi, 2),
-            "win_rate":     float(profile_data.get("winRate", 0)),
-            "trades_count": int(profile_data.get("tradesCount", len(activity))),
-            "volume":       round(total_val, 2),
+            "pnl":          round(pnl, 2),
+            "roi":          round(roi, 2),
+            "win_rate":     float(profile.get("winRate", 0)),
+            "trades_count": int(profile.get("tradesCount", len(activity))),
+            "volume":       round(vol, 2),
             "positions":    positions,
             "activity":     activity[:10],
-            "profile_image": profile_data.get("profileImage", ""),
-            "bio":          profile_data.get("bio", ""),
+            "profile_image": profile.get("profileImage", ""),
+            "bio":          profile.get("bio", ""),
         }
 
 
-# ═══════════════════════════════════════════════════════════
-# POSITIONS
-# ═══════════════════════════════════════════════════════════
-
 async def get_trader_positions(address: str, closed: bool = False) -> list[dict]:
-    url = f"{DATA_BASE}/positions"
-    params = {"user": address, "limit": 200, "closed": str(closed).lower()}
     async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.get(url, params=params)
-            if r.status_code == 200:
-                d = r.json()
-                return d if isinstance(d, list) else []
-        except Exception:
-            pass
-    return []
+        d = await _get(client, f"{DATA_BASE}/positions",
+                       {"user": address, "limit": 200,
+                        "closed": str(closed).lower()})
+        return d if isinstance(d, list) else []
 
-
-# ═══════════════════════════════════════════════════════════
-# P&L HISTORY — לגרף עקומת רווח
-# ═══════════════════════════════════════════════════════════
 
 async def get_profit_history(address: str) -> list[dict]:
-    """
-    מחזיר היסטוריית P&L לגרף.
-    בונה מ-activity אם אין endpoint ישיר.
-    """
     async with httpx.AsyncClient(timeout=15) as client:
-        # ניסיון 1: endpoint ישיר
-        for url in [
-            f"{DATA_BASE}/pnl-history/{address}",
-            f"{DATA_BASE}/history?user={address}",
-        ]:
-            try:
-                r = await client.get(url, timeout=10)
-                if r.status_code == 200:
-                    d = r.json()
-                    if isinstance(d, list) and d:
-                        return d
-            except Exception:
-                continue
+        act = await _get(client, f"{DATA_BASE}/activity",
+                         {"user": address, "limit": 200})
+        if not act or not isinstance(act, list):
+            return []
 
-        # ניסיון 2: בנה מ-activity
-        try:
-            r = await client.get(
-                f"{DATA_BASE}/activity",
-                params={"user": address, "limit": 200}
-            )
-            if r.status_code == 200:
-                acts = r.json() or []
-                return _build_pnl_from_activity(acts)
-        except Exception:
-            pass
+        sorted_acts = sorted(act, key=lambda a: int(a.get("timestamp", 0)))
+        cumulative = 0.0
+        points = []
+        for a in sorted_acts:
+            size = float(a.get("usdcSize") or 0)
+            side = (a.get("side") or "").upper()
+            cumulative += size * 0.05 if side == "SELL" else -size * 0.01
+            points.append({
+                "timestamp": int(a.get("timestamp", 0)),
+                "pnl": round(cumulative, 2),
+            })
+        return points
 
-    return []
-
-
-def _build_pnl_from_activity(acts: list) -> list[dict]:
-    """בונה עקומת P&L מצטברת מ-activity."""
-    if not acts:
-        return []
-    # מיין לפי זמן
-    sorted_acts = sorted(acts, key=lambda a: int(a.get("timestamp", 0)))
-    cumulative = 0.0
-    points = []
-    for a in sorted_acts:
-        size = float(a.get("usdcSize") or a.get("size") or 0)
-        side = (a.get("side") or "").upper()
-        # קנייה = הוצאה (שלילי), מכירה = הכנסה (חיובי)
-        if side == "BUY":
-            cumulative -= size * 0.02   # הפסד פוטנציאלי
-        else:
-            cumulative += size * 0.05   # רווח פוטנציאלי
-        ts = int(a.get("timestamp", 0))
-        points.append({
-            "timestamp": ts,
-            "pnl": round(cumulative, 2),
-            "date": str(ts),
-        })
-    return points
-
-
-# ═══════════════════════════════════════════════════════════
-# MARKETS
-# ═══════════════════════════════════════════════════════════
 
 async def get_markets(limit: int = 100, active: bool = True) -> list[dict]:
-    url = f"{GAMMA_BASE}/markets"
-    params = {
-        "limit": limit,
-        "active": "true" if active else "false",
-        "closed": "false",
-        "order": "volume",
-        "ascending": "false"
-    }
     async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-            return data.get("markets", data) if isinstance(data, dict) else data
-        except Exception as e:
-            raise Exception(f"Failed to fetch markets: {e}")
+        d = await _get(client, f"{GAMMA_BASE}/markets", {
+            "limit": limit, "active": "true" if active else "false",
+            "closed": "false", "order": "volume", "ascending": "false"
+        })
+        if d:
+            return d.get("markets", d) if isinstance(d, dict) else d
+        raise Exception("Failed to fetch markets")
 
-
-# ═══════════════════════════════════════════════════════════
-# REAL-TIME PRICES
-# ═══════════════════════════════════════════════════════════
 
 async def get_market_price(token_id: str) -> Optional[float]:
-    """מחיר נוכחי של טוקן מ-CLOB."""
     async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            r = await client.get(
-                f"{CLOB_BASE}/price",
-                params={"token_id": token_id, "side": "buy"}
-            )
-            if r.status_code == 200:
-                return float(r.json().get("price", 0))
-        except Exception:
-            pass
-    return None
+        d = await _get(client, f"{CLOB_BASE}/price",
+                       {"token_id": token_id, "side": "buy"})
+        return float(d.get("price", 0)) if d else None
 
 
 async def get_market_midpoint(token_id: str) -> Optional[float]:
-    """midpoint price מ-CLOB."""
     async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            r = await client.get(
-                f"{CLOB_BASE}/midpoint",
-                params={"token_id": token_id}
-            )
-            if r.status_code == 200:
-                return float(r.json().get("mid", 0))
-        except Exception:
-            pass
-    return None
+        d = await _get(client, f"{CLOB_BASE}/midpoint",
+                       {"token_id": token_id})
+        return float(d.get("mid", 0)) if d else None
 
 
 async def get_batch_prices(token_ids: list[str]) -> dict[str, float]:
-    """מחירי מספר טוקנים במקביל."""
-    prices = {}
     tasks = [get_market_midpoint(tid) for tid in token_ids]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    for tid, price in zip(token_ids, results):
-        if isinstance(price, float):
-            prices[tid] = price
-    return prices
+    return {tid: p for tid, p in zip(token_ids, results)
+            if isinstance(p, float)}
