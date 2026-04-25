@@ -144,15 +144,24 @@ class CopyEngine:
             trader_size   = float(trade.get("usdcSize") or trade.get("size") or 0)
             price         = float(trade.get("price") or 0.5)
             market_title  = trade.get("title") or trade.get("market") or ""
-            outcome_index = int(trade.get("outcomeIndex") or 0)
+            outcome_index = int(trade.get("outcomeIndex") if trade.get("outcomeIndex") is not None else 0)
+            token_id      = trade.get("asset") or ""   # token_id for live price
             trader_tx     = trade.get("transactionHash", "")
             trade_type = (trade.get("type") or "TRADE").upper()
             if trade_type != "TRADE":
                 return
             if not condition_id or trader_size <= 0:
                 return
+            # Determine YES/NO: prefer explicit "outcome" field over outcomeIndex
+            outcome_str = (trade.get("outcome") or "").strip().upper()
+            if outcome_str in ("YES", "Y"):
+                outcome_is_yes = True
+            elif outcome_str in ("NO", "N"):
+                outcome_is_yes = False
+            else:
+                outcome_is_yes = (outcome_index == 0)  # fallback: 0=YES, 1=NO
             if side_raw == "BUY":
-                our_side = "YES" if outcome_index == 0 else "NO"
+                our_side = "YES" if outcome_is_yes else "NO"
             elif side_raw == "SELL":
                 sell_mode = getattr(setting, "sell_mode", "mirror")
                 if sell_mode in ("mirror", "sell_all"):
