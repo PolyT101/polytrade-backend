@@ -139,14 +139,16 @@ async def resume_copy(setting_id: int, user_id: str = "1"):
 
 
 @router.get("/history")
-async def get_history(user_id: str = "1", limit: int = 200):
+async def get_history(user_id: str = "1", limit: int = 500,
+                      setting_id: int = None):
     from db import SessionLocal
     from models.copy_settings import CopyTrade
     db = SessionLocal()
     try:
-        trades = db.query(CopyTrade).filter(
-            CopyTrade.user_id == user_id
-        ).order_by(CopyTrade.opened_at.desc()).limit(limit).all()
+        q = db.query(CopyTrade).filter(CopyTrade.user_id == user_id)
+        if setting_id:
+            q = q.filter(CopyTrade.copy_settings_id == setting_id)
+        trades = q.order_by(CopyTrade.opened_at.desc()).limit(limit).all()
         return [_fmt_trade(t) for t in trades]
     except Exception:
         return []
@@ -212,27 +214,55 @@ async def get_stats(user_id: str = "1"):
 
 @router.post("/cleanup-duplicates")
 async def cleanup_duplicates(user_id: str = "1"):
-    """מחק duplicate demo trades — שמור רק את הראשון לכל tx_hash לכל setting."""
+    """
+    מחק duplicate demo trades ועסקאות של settings לא פעילים.
+    שומר רק עסקאות של settings פעילים + עסקאות סגורות.
+    """
     from db import SessionLocal
-    from models.copy_settings import CopyTrade
+    from models.copy_settings import CopyTrade, CopySettings
     db = SessionLocal()
     try:
-        trades = db.query(CopyTrade).filter(
+        # Get active setting IDs
+        active_ids = set(
+            s.id for s in db.query(CopySettings).filter(
+                CopySettings.user_id == user_id,
+                CopySettings.is_active == True
+            ).all()
+        )
+
+        # Delete demo trades from inactive settings (keeping closed ones)
+        deleted_inactive = db.query(CopyTrade).filter(
             CopyTrade.user_id == user_id,
             CopyTrade.status == "demo",
-        ).order_by(CopyTrade.id.asc()).all()
+            CopyTrade.copy_settings_id.notin_(active_ids) if active_ids else True,
+        ).delete(synchronize_session=False)
 
-        seen = set()
-        deleted = 0
-        for t in trades:
-            key = (t.tx_hash or str(t.id), t.copy_settings_id)
-            if t.tx_hash and key in seen:
-                db.delete(t)
-                deleted += 1
-            else:
-                seen.add(key)
+        # Also dedup by tx_hash within active settings
+        if active_ids:
+            trades = db.query(CopyTrade).filter(
+                CopyTrade.user_id == user_id,
+                CopyTrade.status == "demo",
+                CopyTrade.copy_settings_id.in_(active_ids),
+            ).order_by(CopyTrade.id.asc()).all()
+            seen = set()
+            deleted_dups = 0
+            for t in trades:
+                key = (t.tx_hash or str(t.id), t.copy_settings_id)
+                if t.tx_hash and key in seen:
+                    db.delete(t)
+                    deleted_dups += 1
+                else:
+                    seen.add(key)
+        else:
+            deleted_dups = 0
+
         db.commit()
-        return {"deleted": deleted, "remaining": len(trades) - deleted}
+        remaining = db.query(CopyTrade).filter(CopyTrade.user_id == user_id).count()
+        return {
+            "deleted_inactive": deleted_inactive,
+            "deleted_duplicates": deleted_dups,
+            "remaining": remaining
+        }
     except Exception as e:
         db.rollback()
         raise HTTPException(500, str(e))
