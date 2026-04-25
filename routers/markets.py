@@ -23,6 +23,28 @@ async def pm_get(url: str, params: dict = None):
         r.raise_for_status()
         return r.json()
 
+
+@router.get("/debug-leaderboard")
+async def debug_leaderboard():
+    """בדיקת חיבור ל-Polymarket v1/leaderboard מהשרת."""
+    import httpx
+    results = {}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for tp in ["all", "day"]:
+            try:
+                r = await client.get(
+                    f"{DATA}/v1/leaderboard",
+                    params={"limit": 3, "timePeriod": tp, "orderBy": "pnl"},
+                    headers=HEADERS
+                )
+                results[tp] = {
+                    "status": r.status_code,
+                    "body": r.text[:300],
+                }
+            except Exception as e:
+                results[tp] = {"error": str(e)}
+    return results
+
 @router.get("/markets")
 async def get_markets(limit: int = Query(100), offset: int = Query(0)):
     try:
