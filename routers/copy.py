@@ -230,12 +230,21 @@ async def cleanup_duplicates(user_id: str = "1"):
             ).all()
         )
 
-        # Delete demo trades from inactive settings (keeping closed ones)
-        deleted_inactive = db.query(CopyTrade).filter(
+        # Delete demo trades from inactive settings OR with no setting_id
+        q = db.query(CopyTrade).filter(
             CopyTrade.user_id == user_id,
             CopyTrade.status == "demo",
-            CopyTrade.copy_settings_id.notin_(active_ids) if active_ids else True,
-        ).delete(synchronize_session=False)
+        )
+        if active_ids:
+            from sqlalchemy import or_
+            q = q.filter(or_(
+                CopyTrade.copy_settings_id == None,          # null = old/orphan trades
+                CopyTrade.copy_settings_id.notin_(active_ids) # inactive setting trades
+            ))
+        else:
+            q = q.filter(CopyTrade.copy_settings_id == None)
+
+        deleted_inactive = q.delete(synchronize_session=False)
 
         # Also dedup by tx_hash within active settings
         if active_ids:
