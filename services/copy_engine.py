@@ -344,6 +344,7 @@ class CopyEngine:
             )
             count = db.query(CopyTrade).filter(
                 CopyTrade.copy_settings_id == setting.id,
+                CopyTrade.status == "demo",   # only count open positions, not closed ones
                 CopyTrade.opened_at >= today_start,
             ).count()
             return count < int(max_daily)
