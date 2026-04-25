@@ -11,6 +11,13 @@ CLOB_API   = "https://clob.polymarket.com"
 POLL_SECS  = 10
 PRICE_SECS = 30
 
+PM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Origin": "https://polymarket.com",
+    "Referer": "https://polymarket.com/",
+}
+
 
 class CopyEngine:
     def __init__(self):
@@ -69,7 +76,7 @@ class CopyEngine:
             r = await client.get(
                 f"{DATA_API}/activity",
                 params={"user": addr, "limit": 20},
-                headers={"Accept": "application/json"}
+                headers=PM_HEADERS
             )
             if not r.is_success:
                 return
@@ -125,6 +132,9 @@ class CopyEngine:
             market_title  = trade.get("title") or trade.get("market") or ""
             outcome_index = int(trade.get("outcomeIndex") or 0)
             trader_tx     = trade.get("transactionHash", "")
+            trade_type = (trade.get("type") or "TRADE").upper()
+            if trade_type != "TRADE":
+                return
             if not condition_id or trader_size <= 0:
                 return
             if side_raw == "BUY":
