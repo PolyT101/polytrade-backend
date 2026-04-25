@@ -116,11 +116,25 @@ class CopyEngine:
             ).first()
             if state:
                 state.last_seen_ts = ts
+                db.commit()
             else:
-                db.add(CopyEngineState(setting_id=setting.id, last_seen_ts=ts))
-            db.commit()
+                new_state = CopyEngineState(setting_id=setting.id, last_seen_ts=ts)
+                db.add(new_state)
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    # Row might have been inserted by concurrent tick — update instead
+                    db.query(CopyEngineState).filter(
+                        CopyEngineState.setting_id == setting.id
+                    ).update({"last_seen_ts": ts})
+                    db.commit()
         except Exception as e:
-            logger.warning("Watermark error: %s", e)
+            logger.error("Watermark save error: %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
     async def _process_trade(self, client, db, trade, setting):
         try:
@@ -146,6 +160,14 @@ class CopyEngine:
                 return
             else:
                 our_side = "YES"
+            # Dedup: skip if this tx_hash already saved for this setting
+            if trader_tx:
+                dup = db.query(CopyTrade).filter(
+                    CopyTrade.tx_hash == trader_tx,
+                    CopyTrade.copy_settings_id == setting.id,
+                ).first()
+                if dup:
+                    return
             copy_size = self._calc_size(trader_size, setting)
             if copy_size < 1.0:
                 return
