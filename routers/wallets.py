@@ -68,6 +68,39 @@ def list_wallets(user_id: str, db: Session = Depends(get_db)):
     ]
 
 
+@router.post("/{user_id}/recover")
+def recover_wallet(user_id: str, db: Session = Depends(get_db)):
+    """יוצר ארנק ראשי למשתמש שנרשם לפני תמיכת ארנקים."""
+    existing = db.query(Wallet).filter(Wallet.user_id == user_id).first()
+    if existing:
+        return {"already_exists": True, "address": existing.address}
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    new_w = create_wallet()
+    wallet = Wallet(
+        user_id=user_id,
+        address=new_w["address"],
+        encrypted_private_key=new_w["encrypted_private_key"],
+        label="ארנק ראשי",
+        is_default=True,
+        cached_usdc_balance=0.0,
+    )
+    user.main_wallet_address = new_w["address"]
+    db.add(wallet)
+    db.commit()
+    db.refresh(wallet)
+
+    return {
+        "id":                 wallet.id,
+        "address":            wallet.address,
+        "private_key_backup": new_w["private_key_plaintext"],
+        "warning": "שמור את ה-private key במקום בטוח! הוא לא יוצג שוב.",
+    }
+
+
 @router.post("/{user_id}/create")
 def create_user_wallet(user_id: str, req: CreateWalletRequest, db: Session = Depends(get_db)):
     """יוצר ארנק Polygon חדש עבור המשתמש."""

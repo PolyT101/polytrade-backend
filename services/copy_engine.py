@@ -2,7 +2,7 @@ from typing import Optional
 import asyncio
 import httpx
 import logging
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +130,8 @@ class CopyEngine:
             if side_raw == "BUY":
                 our_side = "YES" if outcome_index == 0 else "NO"
             elif side_raw == "SELL":
-                our_side = "NO" if outcome_index == 0 else "YES"
-                if getattr(setting, "sell_mode", "mirror") == "mirror":
+                sell_mode = getattr(setting, "sell_mode", "mirror")
+                if sell_mode in ("mirror", "sell_all"):
                     await self._mirror_sell(db, setting, condition_id, price)
                 return
             else:
@@ -270,19 +270,23 @@ class CopyEngine:
         return amt
 
     async def _check_budget(self, db, setting, needed: float) -> bool:
+        max_loss = getattr(setting, "max_daily_loss_usd", None)
+        if not max_loss:
+            return True
         try:
             from models.copy_settings import CopyTrade
-            trades = db.query(CopyTrade).filter(
+            today_start = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            closed_today = db.query(CopyTrade).filter(
                 CopyTrade.copy_settings_id == setting.id,
-                CopyTrade.status.in_(["demo", "open", "executed"])
+                CopyTrade.status == "closed",
+                CopyTrade.closed_at >= today_start,
+                CopyTrade.pnl_usd < 0,
             ).all()
-            spent  = sum(t.amount_usdc or 0 for t in trades)
-            budget = float(getattr(setting, "max_daily_loss_usd", None) or 1000)
-            if spent + needed > budget:
-                if spent >= budget:
-                    setting.is_active = False
-                    db.commit()
-                    logger.warning("Setting %d auto-stopped: budget depleted", setting.id)
+            daily_loss = abs(sum(t.pnl_usd or 0 for t in closed_today))
+            if daily_loss >= float(max_loss):
+                logger.warning("Setting %d auto-stopped: daily loss limit reached", setting.id)
                 return False
             return True
         except Exception:
@@ -294,12 +298,13 @@ class CopyEngine:
             return True
         try:
             from models.copy_settings import CopyTrade
-            from sqlalchemy import func
-            today = date.today()
-            count = db.query(func.count(CopyTrade.id)).filter(
+            today_start = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            count = db.query(CopyTrade).filter(
                 CopyTrade.copy_settings_id == setting.id,
-                func.date(CopyTrade.opened_at) == today
-            ).scalar() or 0
+                CopyTrade.opened_at >= today_start,
+            ).count()
             return count < int(max_daily)
         except Exception:
             return True

@@ -68,19 +68,41 @@ class LoginRequest(BaseModel):
 def register(req: RegisterRequest, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == req.email).first()
     if existing:
-        # User exists — update password and return token
+        # User exists — update password and ensure wallet exists
         try:
             existing.password_hash = _hash_pw(req.password)
             db.commit()
         except Exception:
             pass
+
+        existing_wallet = db.query(Wallet).filter(Wallet.user_id == existing.id).first()
+        wallet_address = existing.main_wallet_address
+        if not existing_wallet:
+            wallet_data = create_wallet()
+            wallet_address = wallet_data["address"]
+            try:
+                existing.main_wallet_address = wallet_address
+                w = Wallet(
+                    user_id=existing.id,
+                    label="ארנק ראשי",
+                    address=wallet_address,
+                    encrypted_private_key=wallet_data["encrypted_private_key"],
+                    is_default=True,
+                    cached_usdc_balance=0.0,
+                    cached_matic_balance=0.0,
+                )
+                db.add(w)
+                db.commit()
+            except Exception:
+                db.rollback()
+
         token = _make_token(existing.id)
         return {
             "access_token":   token,
             "token_type":     "bearer",
             "user_id":        existing.id,
             "email":          existing.email,
-            "wallet_address": existing.main_wallet_address,
+            "wallet_address": wallet_address,
             "note":           "account_already_existed",
         }
 

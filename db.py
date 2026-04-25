@@ -28,5 +28,9 @@ def get_db():
 
 def create_tables():
     """קרא לזה פעם אחת ליצירת כל הטבלאות."""
-    from models.copy_settings import User, CopySettings, CopyTrade
+    from models.copy_settings import User, CopySettings, CopyTrade, CopyEngineState
+    from models.wallet import Wallet
+    from models.withdrawal_whitelist import WithdrawalWhitelist
+    from models.watchlist import WatchlistEntry
+    from models.market_watchlist import MarketWatchlistEntry
     Base.metadata.create_all(bind=engine)
