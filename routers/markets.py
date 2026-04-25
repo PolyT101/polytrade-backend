@@ -37,26 +37,21 @@ async def get_markets(limit: int = Query(100), offset: int = Query(0)):
         raise HTTPException(502, f"Markets error: {e}")
 
 @router.get("/leaderboard")
-async def get_leaderboard(limit: int = Query(50), offset: int = Query(0)):
-    # data-api.polymarket.com/leaderboard is the correct endpoint
+async def get_leaderboard(
+    limit: int = Query(100), offset: int = Query(0),
+    period: str = Query("all"), order: str = Query("pnl")
+):
+    PERIOD_MAP = {"1d": "day", "7d": "week", "30d": "month",
+                  "day": "day", "week": "week", "month": "month", "all": "all"}
+    tp = PERIOD_MAP.get(period, "all")
+    ob = "pnl" if order not in ("pnl", "vol") else order
     try:
-        data = await pm_get(f"{DATA}/leaderboard", {
-            "limit": limit, "offset": offset,
-            "order": "pnl", "ascending": "false"
+        data = await pm_get(f"{DATA}/v1/leaderboard", {
+            "limit": min(limit, 500), "offset": offset,
+            "timePeriod": tp, "orderBy": ob,
         })
-        arr = data if isinstance(data, list) else \
-              data.get("data") or data.get("traders") or \
-              data.get("profiles") or data.get("results") or []
-        if arr:
-            return {"traders": arr, "count": len(arr)}
-        # Fallback: profiles endpoint
-        data2 = await pm_get(f"{DATA}/profiles", {
-            "limit": limit, "offset": offset,
-            "order": "pnl", "ascending": "false"
-        })
-        arr2 = data2 if isinstance(data2, list) else \
-               data2.get("data") or data2.get("profiles") or []
-        return {"traders": arr2, "count": len(arr2)}
+        arr = data if isinstance(data, list) else []
+        return {"traders": arr, "count": len(arr)}
     except Exception as e:
         raise HTTPException(502, f"Leaderboard error: {e}")
 

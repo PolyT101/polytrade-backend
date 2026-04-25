@@ -1,7 +1,7 @@
 """
-services/polymarket_service.py — v4
+services/polymarket_service.py — v5
 ------------------------------------
-תוקן: leaderboard endpoint + profile fields נכונים
+Real Polymarket API: /v1/leaderboard with timePeriod=day|week|month|all
 """
 import httpx
 import asyncio
@@ -33,76 +33,49 @@ async def _get(client: httpx.AsyncClient, url: str, params: dict = None) -> Opti
 # LEADERBOARD
 # ═══════════════════════════════════════════════════════════
 
-async def get_leaderboard(limit: int = 100, offset: int = 0) -> list[dict]:
+async def get_leaderboard(limit: int = 100, offset: int = 0,
+                          period: str = "all", order: str = "pnl") -> list[dict]:
+    """
+    Real Polymarket leaderboard — /v1/leaderboard
+    timePeriod: day | week | month | all
+    orderBy:    pnl | vol
+    """
+    # Validate/map period
+    PERIOD_MAP = {"1d": "day", "7d": "week", "30d": "month",
+                  "day": "day", "week": "week", "month": "month", "all": "all"}
+    tp = PERIOD_MAP.get(period, "all")
+    ob = "pnl" if order not in ("pnl", "vol") else order
+
     async with httpx.AsyncClient(timeout=20) as client:
-
-        # Strategy 1: data-api leaderboard (exact Polymarket endpoint)
-        data = await _get(client, f"{DATA_BASE}/leaderboard",
-                          {"limit": limit, "offset": offset,
-                           "order": "pnl", "ascending": "false"})
-        if data:
-            items = data if isinstance(data, list) else \
-                    data.get("data", data.get("leaderboard", data.get("profiles", [])))
-            if items:
-                return [_norm_trader(t, i) for i, t in enumerate(items)]
-
-        # Strategy 2: profiles endpoint
-        data = await _get(client, f"{DATA_BASE}/profiles",
-                          {"limit": limit, "offset": offset,
-                           "order": "pnl", "ascending": "false"})
-        if data:
-            items = data if isinstance(data, list) else data.get("profiles", [])
-            if items:
-                return [_norm_trader(t, i) for i, t in enumerate(items)]
-
-        # Strategy 3: build from activity (aggregation)
-        data = await _get(client, f"{DATA_BASE}/activity", {"limit": 500})
+        data = await _get(client, f"{DATA_BASE}/v1/leaderboard",
+                          {"limit": min(limit, 500), "offset": offset,
+                           "timePeriod": tp, "orderBy": ob})
         if data and isinstance(data, list):
-            return _build_from_activity(data, limit)
+            return [_norm_trader(t, i) for i, t in enumerate(data)]
 
     return []
 
 
 def _norm_trader(t: dict, i: int) -> dict:
-    addr = t.get("proxyWallet") or t.get("address") or t.get("user") or ""
-    name = (t.get("name") or t.get("pseudonym") or t.get("username") or
-            t.get("displayName") or _short_addr(addr))
-    pnl    = float(t.get("pnl") or t.get("profit") or t.get("totalPnl") or 0)
-    roi    = float(t.get("percentPnl") or t.get("roi") or t.get("roiPct") or 0)
-    win    = float(t.get("winRate") or t.get("win_rate") or t.get("pctPositive") or 0)
-    trades = int(t.get("numTrades") or t.get("tradesCount") or t.get("trades") or 0)
-    volume = float(t.get("volume") or t.get("volumeTraded") or t.get("totalVolume") or 0)
+    addr   = t.get("proxyWallet") or t.get("address") or ""
+    name   = t.get("userName") or t.get("pseudonym") or t.get("name") or _short_addr(addr)
+    pnl    = float(t.get("pnl") or 0)
+    volume = float(t.get("vol") or t.get("volume") or 0)
+    # ROI = pnl / volume * 100 (approximate, since API doesn't provide it directly)
+    roi    = round((pnl / volume * 100), 1) if volume > 0 else 0.0
     return {
-        "address":      addr,
-        "name":         name,
-        "pnl":          round(pnl, 2),
-        "roi":          round(roi, 2),
-        "win_rate":     round(win, 1),
-        "trades_count": trades,
-        "volume":       round(volume, 2),
+        "address":       addr,
+        "name":          name,
+        "pnl":           round(pnl, 2),
+        "roi":           roi,
+        "win_rate":      0.0,   # not provided by leaderboard endpoint
+        "trades_count":  0,     # not provided by leaderboard endpoint
+        "volume":        round(volume, 2),
+        "rank":          int(t.get("rank") or i + 1),
+        "verified":      bool(t.get("verifiedBadge")),
+        "profile_image": t.get("profileImage") or "",
+        "x_username":    t.get("xUsername") or "",
     }
-
-
-def _build_from_activity(acts: list, limit: int) -> list[dict]:
-    wallets: dict = {}
-    for a in acts:
-        addr = a.get("proxyWallet", "")
-        if not addr:
-            continue
-        if addr not in wallets:
-            wallets[addr] = {
-                "address": addr,
-                "name": a.get("pseudonym") or a.get("name") or _short_addr(addr),
-                "volume": 0.0, "trades": 0, "pnl": 0.0,
-                "roi": 0.0, "win_rate": 50.0, "trades_count": 0,
-            }
-        w = wallets[addr]
-        w["volume"]       += float(a.get("usdcSize") or 0)
-        w["trades"]       += 1
-        w["trades_count"] += 1
-
-    result = sorted(wallets.values(), key=lambda x: x["volume"], reverse=True)[:limit]
-    return result
 
 
 def _short_addr(addr: str) -> str:

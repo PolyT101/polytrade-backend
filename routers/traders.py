@@ -18,11 +18,14 @@ router = APIRouter()
 
 @router.get("")
 async def list_traders(
-    limit:  int = Query(50,  ge=1, le=500),
+    limit:  int = Query(100, ge=1, le=500),
     offset: int = Query(0,   ge=0),
+    period: str = Query("all"),   # day | week | month | all
+    order:  str = Query("pnl"),   # pnl | vol
 ):
     try:
-        return await get_leaderboard(limit=limit, offset=offset)
+        return await get_leaderboard(limit=limit, offset=offset,
+                                     period=period, order=order)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
