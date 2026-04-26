@@ -114,6 +114,38 @@ async def stop_copy(setting_id: int, user_id: str = "1"):
         db.close()
 
 
+@router.put("/settings/{setting_id}")
+async def update_setting(setting_id: int, data: CopySettingIn, user_id: str = "1"):
+    from db import SessionLocal
+    from models.copy_settings import CopySettings
+    db = SessionLocal()
+    try:
+        s = db.query(CopySettings).filter(
+            CopySettings.id == setting_id,
+            CopySettings.user_id == user_id
+        ).first()
+        if not s:
+            raise HTTPException(404, "לא נמצא")
+        s.entry_mode         = data.entry_mode
+        s.entry_amount       = data.entry_amount
+        s.take_profit_pct    = data.take_profit_pct
+        s.stop_loss_pct      = data.stop_loss_pct
+        s.max_daily_trades   = data.max_daily_trades
+        s.max_daily_loss_usd = data.max_daily_loss_usd
+        s.sell_mode          = data.sell_mode
+        if data.trader_name:
+            s.trader_name = data.trader_name
+        db.commit()
+        db.refresh(s)
+        return _fmt_setting(s)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
 @router.post("/settings/{setting_id}/activate")
 async def resume_copy(setting_id: int, user_id: str = "1"):
     """הפעלה מחדש של קופי שהופסק."""
