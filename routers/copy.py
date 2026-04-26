@@ -311,6 +311,53 @@ async def cleanup_duplicates(user_id: str = "1"):
         db.close()
 
 
+@router.get("/debug/engine")
+async def debug_engine(user_id: str = "1"):
+    """אבחון מנוע הקופי — מראה watermark ופעילות אחרונה לכל setting."""
+    from db import SessionLocal
+    from models.copy_settings import CopySettings, CopyEngineState, CopyTrade
+    from datetime import datetime, timezone
+    db = SessionLocal()
+    try:
+        settings = db.query(CopySettings).filter(
+            CopySettings.user_id == user_id,
+            CopySettings.is_active == True
+        ).all()
+        result = []
+        PM_H = {"Accept": "application/json", "Origin": "https://polymarket.com",
+                "Referer": "https://polymarket.com/", "User-Agent": "Mozilla/5.0"}
+        async with httpx.AsyncClient(timeout=10) as client:
+            for s in settings:
+                state = db.query(CopyEngineState).filter(
+                    CopyEngineState.setting_id == s.id
+                ).first()
+                wm = int(state.last_seen_ts) if state and state.last_seen_ts else 0
+                wm_dt = datetime.fromtimestamp(wm, tz=timezone.utc).isoformat() if wm else None
+                r = await client.get(f"{DATA_API}/activity",
+                    params={"user": s.trader_address, "limit": 10}, headers=PM_H)
+                activity = r.json() if r.is_success and isinstance(r.json(), list) else []
+                new_count = len([t for t in activity if int(t.get("timestamp", 0)) > wm])
+                open_cnt  = db.query(CopyTrade).filter(
+                    CopyTrade.copy_settings_id == s.id, CopyTrade.status == "demo").count()
+                result.append({
+                    "setting_id":   s.id,
+                    "trader":       s.trader_name or s.trader_address[:12],
+                    "watermark_dt": wm_dt,
+                    "open_positions": open_cnt,
+                    "pending_new_trades": new_count,
+                    "last_5_activity": [
+                        {"ts": a.get("timestamp"), "type": a.get("type"),
+                         "side": a.get("side"), "price": a.get("price"),
+                         "is_new": int(a.get("timestamp", 0)) > wm,
+                         "title": (a.get("title") or "")[:35]}
+                        for a in activity[:5]
+                    ]
+                })
+        return result
+    finally:
+        db.close()
+
+
 @router.get("/live/{trader_address}")
 async def get_trader_live(trader_address: str):
     try:

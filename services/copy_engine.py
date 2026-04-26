@@ -90,8 +90,10 @@ class CopyEngine:
                     continue
                 new_max = max(int(t.get("timestamp", 0)) for t in new_trades)
                 self._set_watermark(db, setting, new_max)
-                logger.info("%d new trades from %s", len(new_trades), addr[:10])
-                for trade in new_trades:
+                # Process oldest-first so BUY is always handled before its REDEEM/SELL
+                new_trades_ordered = sorted(new_trades, key=lambda t: int(t.get("timestamp", 0)))
+                logger.info("%d new trades from %s", len(new_trades_ordered), addr[:10])
+                for trade in new_trades_ordered:
                     await self._process_trade(client, db, trade, setting)
         except Exception as e:
             logger.warning("Check trader error: %s", e)
@@ -155,7 +157,14 @@ class CopyEngine:
                 if condition_id:
                     sell_mode = getattr(setting, "sell_mode", "mirror")
                     if sell_mode in ("mirror", "sell_all"):
-                        exit_price = price if price > 0 else 1.0
+                        if trade_type == "REDEEM":
+                            # REDEEM = market resolved, winning share = $1
+                            exit_price = 1.0
+                        else:
+                            # MERGE: try live midpoint from CLOB, fall back to event price
+                            asset = trade.get("asset") or ""
+                            live = await self._get_price(client, asset) if asset else None
+                            exit_price = live if live is not None else (price if price > 0 else 1.0)
                         await self._mirror_sell(db, setting, condition_id, exit_price)
                 return
 
