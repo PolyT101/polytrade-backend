@@ -75,7 +75,7 @@ class CopyEngine:
         try:
             r = await client.get(
                 f"{DATA_API}/activity",
-                params={"user": addr, "limit": 20},
+                params={"user": addr, "limit": 50},
                 headers=PM_HEADERS
             )
             if not r.is_success:
@@ -141,15 +141,17 @@ class CopyEngine:
     async def _process_trade(self, client, db, trade, setting):
         try:
             from models.copy_settings import CopyTrade
-            condition_id  = trade.get("conditionId", "")
+            condition_id  = trade.get("conditionId") or trade.get("conditionId_") or trade.get("marketId") or ""
             side_raw      = (trade.get("side") or "").upper()
-            trader_size   = float(trade.get("usdcSize") or trade.get("size") or 0)
-            price         = float(trade.get("price") or 0.5)
-            market_title  = trade.get("title") or trade.get("market") or ""
+            trader_size   = float(trade.get("usdcSize") or trade.get("size") or trade.get("amount") or 0)
+            price         = float(trade.get("price") or trade.get("avgPrice") or 0.5)
+            market_title  = trade.get("title") or trade.get("market") or trade.get("question") or ""
             outcome_index = int(trade.get("outcomeIndex") if trade.get("outcomeIndex") is not None else 0)
             token_id      = trade.get("asset") or ""   # token_id for live price
-            trader_tx     = trade.get("transactionHash", "")
+            trader_tx     = trade.get("transactionHash") or trade.get("txHash") or trade.get("hash") or ""
             trade_type = (trade.get("type") or "TRADE").upper()
+            logger.info("Trade: type=%s side=%s cid=%s size=%.2f tx=%s",
+                        trade_type, side_raw, condition_id[:12] if condition_id else "EMPTY", trader_size, trader_tx[:12] if trader_tx else "")
 
             # MERGE = convert YES+NO→USDC, REDEEM = claim resolved market winnings
             # Both mean the trader is exiting — mirror sell our open position
@@ -171,6 +173,8 @@ class CopyEngine:
             if trade_type != "TRADE":
                 return
             if not condition_id or trader_size <= 0:
+                logger.warning("Skipping trade: empty cid=%r or size=%.2f — keys=%s",
+                               condition_id, trader_size, list(trade.keys()))
                 return
             # Determine YES/NO: prefer explicit "outcome" field over outcomeIndex
             outcome_str = (trade.get("outcome") or "").strip().upper()

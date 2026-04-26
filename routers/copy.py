@@ -321,6 +321,60 @@ async def cleanup_duplicates(user_id: str = "1"):
         db.close()
 
 
+@router.post("/settings/{setting_id}/scan")
+async def manual_scan(setting_id: int, user_id: str = "1"):
+    """סריקה ידנית — אבחון + עיבוד עסקאות לsetting ספציפי."""
+    from db import SessionLocal
+    from models.copy_settings import CopySettings, CopyEngineState
+    from services.copy_engine import copy_engine
+    db = SessionLocal()
+    try:
+        s = db.query(CopySettings).filter(
+            CopySettings.id == setting_id,
+            CopySettings.user_id == user_id
+        ).first()
+        if not s:
+            raise HTTPException(404, "לא נמצא")
+        PM_H = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Origin": "https://polymarket.com",
+            "Referer": "https://polymarket.com/",
+        }
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                f"{DATA_API}/activity",
+                params={"user": s.trader_address, "limit": 50},
+                headers=PM_H
+            )
+            activity = r.json() if r.is_success and isinstance(r.json(), list) else []
+        wm = copy_engine._get_watermark(db, s)
+        new_trades = [t for t in activity if int(t.get("timestamp", 0)) > wm]
+        # Process them through the engine
+        if new_trades:
+            async with httpx.AsyncClient(timeout=20) as client:
+                await copy_engine._check_trader(client, db, s.trader_address, [s])
+        sample = activity[:5]
+        return {
+            "trader": s.trader_address,
+            "trader_name": s.trader_name,
+            "watermark": wm,
+            "activity_total": len(activity),
+            "new_since_watermark": len(new_trades),
+            "processed": bool(new_trades),
+            "sample_fields": [{k: v for k, v in t.items() if k in (
+                "type","side","conditionId","usdcSize","size","price","outcome",
+                "outcomeIndex","transactionHash","timestamp","title","asset"
+            )} for t in sample],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
 @router.get("/debug/engine")
 async def debug_engine(user_id: str = "1"):
     """אבחון מנוע הקופי — מראה watermark ופעילות אחרונה לכל setting."""
