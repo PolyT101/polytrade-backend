@@ -83,6 +83,12 @@ async def create_setting(data: CopySettingIn, user_id: str = "1"):
         db.add(s)
         db.commit()
         db.refresh(s)
+        # Set watermark to NOW — engine will only copy trades made from this moment onwards
+        from models.copy_settings import CopyEngineState
+        from datetime import datetime, timezone
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        db.add(CopyEngineState(setting_id=s.id, last_seen_ts=now_ts))
+        db.commit()
         return _fmt_setting(s)
     except HTTPException:
         raise
