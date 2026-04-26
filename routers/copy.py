@@ -23,6 +23,7 @@ class CopySettingIn(BaseModel):
     max_daily_loss_usd: Optional[float] = None
     sell_mode:         str = "mirror"
     is_active:         bool = True
+    reset_watermark:   bool = False
 
 
 def _db():
@@ -126,6 +127,9 @@ async def update_setting(setting_id: int, data: CopySettingIn, user_id: str = "1
         ).first()
         if not s:
             raise HTTPException(404, "לא נמצא")
+        address_changed = data.trader_address and data.trader_address != s.trader_address
+        if address_changed:
+            s.trader_address = data.trader_address
         s.entry_mode         = data.entry_mode
         s.entry_amount       = data.entry_amount
         s.take_profit_pct    = data.take_profit_pct
@@ -136,6 +140,12 @@ async def update_setting(setting_id: int, data: CopySettingIn, user_id: str = "1
         if data.trader_name:
             s.trader_name = data.trader_name
         db.commit()
+        if address_changed or data.reset_watermark:
+            from models.copy_settings import CopyEngineState
+            db.query(CopyEngineState).filter(
+                CopyEngineState.setting_id == setting_id
+            ).delete()
+            db.commit()
         db.refresh(s)
         return _fmt_setting(s)
     except HTTPException:
