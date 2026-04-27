@@ -46,8 +46,27 @@ app.include_router(smart_money.router,      prefix="/api/smart-money",      tags
 async def startup():
     from db import create_tables
     create_tables()
+    _ensure_default_user()
     from services.copy_engine import copy_engine
     await copy_engine.start()
+
+
+def _ensure_default_user():
+    """Ensure the demo user with id='1' exists after a DB reset."""
+    try:
+        from db import SessionLocal
+        from models.copy_settings import User
+        db = SessionLocal()
+        try:
+            if not db.query(User).filter(User.id == "1").first():
+                db.add(User(id="1", email="demo@polytrade.app"))
+                db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+    except Exception:
+        pass
 
 @app.on_event("shutdown")
 async def shutdown():
