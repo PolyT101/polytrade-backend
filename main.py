@@ -75,4 +75,28 @@ async def shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "3.3.0"}
+    return {"status": "ok", "version": "3.4.0"}
+
+
+@app.post("/api/admin/seed-user")
+def seed_user(secret: str = ""):
+    """One-time endpoint to re-create the default user after a DB reset."""
+    import os
+    if secret != os.getenv("ADMIN_SECRET", "polytrade_seed_2026"):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=403, content={"detail": "forbidden"})
+    from db import SessionLocal
+    from models.copy_settings import User
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.id == "1").first()
+        if existing:
+            return {"status": "already_exists", "user_id": "1"}
+        db.add(User(id="1", email="demo@polytrade.app"))
+        db.commit()
+        return {"status": "created", "user_id": "1"}
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "detail": str(e)}
+    finally:
+        db.close()
