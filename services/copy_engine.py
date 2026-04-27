@@ -274,19 +274,48 @@ class CopyEngine:
                 return
             async with httpx.AsyncClient(timeout=15) as client:
                 for setting in settings:
-                    tp        = setting.take_profit_pct
-                    sl        = setting.stop_loss_pct
-                    sell_mode = setting.sell_mode or "mirror"
-                    if not tp and not sl and sell_mode != "fixed":
-                        continue
                     open_trades = db.query(CopyTrade).filter(
                         CopyTrade.copy_settings_id == setting.id,
                         CopyTrade.status == "demo"
                     ).all()
+                    if not open_trades:
+                        continue
+
+                    # Fetch trader's live positions — correct conditionId→price mapping
+                    trader_pos = await self._get_trader_positions(client, setting.trader_address)
+
+                    tp        = setting.take_profit_pct
+                    sl        = setting.stop_loss_pct
+                    sell_mode = setting.sell_mode or "mirror"
+
                     for trade in open_trades:
-                        cur_price = await self._get_price(client, trade.market_id)
+                        cid = (trade.market_id or "").lower()
+                        pos_info = trader_pos.get(cid) or trader_pos.get(trade.market_id or "")
+
+                        # Detect expired/redeemable markets — close regardless of sell_mode
+                        if pos_info and pos_info.get("redeemable"):
+                            raw_ep = pos_info.get("cur_price")
+                            exit_price = float(raw_ep) if raw_ep is not None else 0.0
+                            entry = trade.price_entry or exit_price or 0.5
+                            size  = trade.amount_usdc or 0
+                            pnl   = size * ((exit_price - entry) / entry) if entry > 0 else -size
+                            trade.price_exit = exit_price
+                            trade.pnl_usd    = round(pnl, 4)
+                            trade.status     = "closed"
+                            trade.closed_at  = datetime.now(timezone.utc)
+                            logger.info("Auto-close [Expired] #%d exit=%.3f P&L=$%.2f", trade.id, exit_price, pnl)
+                            continue
+
+                        if not tp and not sl and sell_mode != "fixed":
+                            continue
+
+                        # Use trader's live position price; fall back to CLOB
+                        cur_price = pos_info.get("cur_price") if pos_info else None
+                        if cur_price is None:
+                            cur_price = await self._get_price(client, trade.market_id)
                         if cur_price is None:
                             continue
+
                         entry   = trade.price_entry or cur_price
                         size    = trade.amount_usdc or 0
                         pnl_pct = ((cur_price - entry) / entry * 100) if entry > 0 else 0
@@ -316,6 +345,35 @@ class CopyEngine:
             logger.error("TP/SL error: %s", e)
         finally:
             db.close()
+
+    async def _get_trader_positions(self, client: httpx.AsyncClient, trader_address: str) -> dict:
+        """Fetch trader's live positions from Data API.
+        Returns dict keyed by conditionId (lowercase) with {cur_price, redeemable}."""
+        try:
+            r = await client.get(
+                f"{DATA_API}/positions",
+                params={"user": trader_address, "limit": 500, "closed": "false"},
+                headers=PM_HEADERS
+            )
+            if not r.is_success:
+                return {}
+            data = r.json()
+            if not isinstance(data, list):
+                return {}
+            result = {}
+            for p in data:
+                cid = (p.get("conditionId") or p.get("market") or "").lower()
+                if not cid:
+                    continue
+                cur = p.get("curPrice")
+                result[cid] = {
+                    "cur_price":  float(cur) if cur is not None else None,
+                    "redeemable": bool(p.get("redeemable") or p.get("isRedeemable")),
+                }
+            return result
+        except Exception as e:
+            logger.warning("get_trader_positions error: %s", e)
+            return {}
 
     async def _get_price(self, client: httpx.AsyncClient, condition_id: str) -> Optional[float]:
         try:

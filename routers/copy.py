@@ -57,15 +57,19 @@ async def create_setting(data: CopySettingIn, user_id: str = "1"):
     from models.copy_settings import CopySettings, CopyEngineState, CopyTrade
     db = SessionLocal()
     try:
-        # If a setting already exists for this trader (any user_id variant), wipe it fully
-        # so re-adding always starts completely fresh — no "already copying" error
-        for existing in db.query(CopySettings).filter(
-            CopySettings.trader_address == data.trader_address
-        ).all():
-            db.query(CopyEngineState).filter(CopyEngineState.setting_id == existing.id).delete()
-            db.query(CopyTrade).filter(CopyTrade.copy_settings_id == existing.id).delete()
-            db.delete(existing)
-        db.commit()
+        # Wipe any existing setting for this trader + create new one atomically.
+        # Both the delete and the insert share one transaction — if the insert fails,
+        # the delete is rolled back and no data is lost.
+        existing_ids = [
+            r.id for r in db.query(CopySettings).filter(
+                CopySettings.trader_address == data.trader_address
+            ).all()
+        ]
+        if existing_ids:
+            from sqlalchemy import tuple_
+            db.query(CopyEngineState).filter(CopyEngineState.setting_id.in_(existing_ids)).delete(synchronize_session=False)
+            db.query(CopyTrade).filter(CopyTrade.copy_settings_id.in_(existing_ids)).delete(synchronize_session=False)
+            db.query(CopySettings).filter(CopySettings.id.in_(existing_ids)).delete(synchronize_session=False)
 
         s = CopySettings(
             user_id=user_id,
@@ -82,14 +86,13 @@ async def create_setting(data: CopySettingIn, user_id: str = "1"):
             is_active=data.is_active,
         )
         db.add(s)
-        db.commit()
-        db.refresh(s)
-        # Set watermark to NOW — engine will only copy trades made from this moment onwards
-        from models.copy_settings import CopyEngineState
+        db.flush()  # assign s.id without committing yet
+
         from datetime import datetime, timezone
         now_ts = int(datetime.now(timezone.utc).timestamp())
         db.add(CopyEngineState(setting_id=s.id, last_seen_ts=now_ts))
-        db.commit()
+        db.commit()  # single atomic commit: wipe old + create new + watermark
+        db.refresh(s)
         return _fmt_setting(s)
     except HTTPException:
         raise
