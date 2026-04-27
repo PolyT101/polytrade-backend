@@ -54,17 +54,18 @@ async def get_settings(user_id: str = "1"):
 @router.post("/settings")
 async def create_setting(data: CopySettingIn, user_id: str = "1"):
     from db import SessionLocal
-    from models.copy_settings import CopySettings
+    from models.copy_settings import CopySettings, CopyEngineState, CopyTrade
     db = SessionLocal()
     try:
-        # בדוק כפילות
-        existing = db.query(CopySettings).filter(
-            CopySettings.user_id == user_id,
-            CopySettings.trader_address == data.trader_address,
-            CopySettings.is_active == True
-        ).first()
-        if existing:
-            raise HTTPException(400, "כבר עושה קופי לטריידר זה")
+        # If a setting already exists for this trader (any user_id variant), wipe it fully
+        # so re-adding always starts completely fresh — no "already copying" error
+        for existing in db.query(CopySettings).filter(
+            CopySettings.trader_address == data.trader_address
+        ).all():
+            db.query(CopyEngineState).filter(CopyEngineState.setting_id == existing.id).delete()
+            db.query(CopyTrade).filter(CopyTrade.copy_settings_id == existing.id).delete()
+            db.delete(existing)
+        db.commit()
 
         s = CopySettings(
             user_id=user_id,
