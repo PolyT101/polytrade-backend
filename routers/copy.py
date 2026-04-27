@@ -43,7 +43,7 @@ async def get_settings(user_id: str = "1"):
     try:
         rows = db.query(CopySettings).filter(
             CopySettings.user_id == user_id
-        ).all()
+        ).order_by(CopySettings.id.asc()).all()
         return [_fmt_setting(r) for r in rows]
     except Exception as e:
         return []
@@ -101,7 +101,7 @@ async def create_setting(data: CopySettingIn, user_id: str = "1"):
 @router.delete("/settings/{setting_id}")
 async def stop_copy(setting_id: int, user_id: str = "1"):
     from db import SessionLocal
-    from models.copy_settings import CopySettings
+    from models.copy_settings import CopySettings, CopyEngineState
     db = SessionLocal()
     try:
         s = db.query(CopySettings).filter(
@@ -110,7 +110,9 @@ async def stop_copy(setting_id: int, user_id: str = "1"):
         ).first()
         if not s:
             raise HTTPException(404, "לא נמצא")
-        s.is_active = False
+        # Hard delete — remove from DB entirely so it never reappears
+        db.query(CopyEngineState).filter(CopyEngineState.setting_id == setting_id).delete()
+        db.delete(s)
         db.commit()
         return {"success": True}
     except HTTPException:
