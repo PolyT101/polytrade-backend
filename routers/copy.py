@@ -101,7 +101,7 @@ async def create_setting(data: CopySettingIn, user_id: str = "1"):
 @router.delete("/settings/{setting_id}")
 async def stop_copy(setting_id: int, user_id: str = "1"):
     from db import SessionLocal
-    from models.copy_settings import CopySettings, CopyEngineState
+    from models.copy_settings import CopySettings, CopyEngineState, CopyTrade
     db = SessionLocal()
     try:
         s = db.query(CopySettings).filter(
@@ -110,14 +110,38 @@ async def stop_copy(setting_id: int, user_id: str = "1"):
         ).first()
         if not s:
             raise HTTPException(404, "לא נמצא")
-        # Hard delete — remove from DB entirely so it never reappears
+        # Full wipe: engine state + all copy trades + the setting itself
         db.query(CopyEngineState).filter(CopyEngineState.setting_id == setting_id).delete()
+        db.query(CopyTrade).filter(CopyTrade.copy_settings_id == setting_id).delete()
         db.delete(s)
         db.commit()
         return {"success": True}
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.delete("/settings")
+async def delete_all_settings(user_id: str = "1"):
+    """מחיקת כל הגדרות הקופי + היסטוריה + watermarks של משתמש — איפוס מלא."""
+    from db import SessionLocal
+    from models.copy_settings import CopySettings, CopyEngineState, CopyTrade
+    db = SessionLocal()
+    try:
+        setting_ids = [s.id for s in db.query(CopySettings.id).filter(
+            CopySettings.user_id == user_id
+        ).all()]
+        if setting_ids:
+            db.query(CopyEngineState).filter(CopyEngineState.setting_id.in_(setting_ids)).delete(synchronize_session=False)
+            db.query(CopyTrade).filter(CopyTrade.copy_settings_id.in_(setting_ids)).delete(synchronize_session=False)
+            db.query(CopySettings).filter(CopySettings.user_id == user_id).delete(synchronize_session=False)
+            db.commit()
+        return {"success": True, "deleted_settings": len(setting_ids)}
+    except Exception as e:
+        db.rollback()
         raise HTTPException(500, str(e))
     finally:
         db.close()
