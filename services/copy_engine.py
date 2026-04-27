@@ -281,18 +281,33 @@ class CopyEngine:
                     if not open_trades:
                         continue
 
-                    # Fetch trader's live positions — correct conditionId→price mapping
                     trader_pos = await self._get_trader_positions(client, setting.trader_address)
-
                     tp        = setting.take_profit_pct
                     sl        = setting.stop_loss_pct
                     sell_mode = setting.sell_mode or "mirror"
 
+                    # Batch CLOB resolution check for trades NOT found in trader's positions.
+                    # Needed because high-frequency traders (like bjprolo) can have 500+
+                    # unredeemed old positions — the positions API limit hides new markets.
+                    unresolved_cids = set()
+                    for trade in open_trades:
+                        cid = (trade.market_id or "").lower()
+                        pos = trader_pos.get(cid) or trader_pos.get(trade.market_id or "")
+                        if pos is None and trade.market_id:
+                            unresolved_cids.add(trade.market_id)
+
+                    clob_resolution = {}  # conditionId → exit_price_for_side
+                    for cid in unresolved_cids:
+                        res = await self._get_clob_resolution(client, cid)
+                        if res is not None:
+                            clob_resolution[cid] = res  # {yes_price, no_price}
+
                     for trade in open_trades:
                         cid = (trade.market_id or "").lower()
                         pos_info = trader_pos.get(cid) or trader_pos.get(trade.market_id or "")
+                        side = (trade.side or "YES").upper()
 
-                        # Detect expired/redeemable markets — close regardless of sell_mode
+                        # 1. Trader's position is redeemable (market resolved, not yet claimed)
                         if pos_info and pos_info.get("redeemable"):
                             raw_ep = pos_info.get("cur_price")
                             exit_price = float(raw_ep) if raw_ep is not None else 0.0
@@ -303,13 +318,27 @@ class CopyEngine:
                             trade.pnl_usd    = round(pnl, 4)
                             trade.status     = "closed"
                             trade.closed_at  = datetime.now(timezone.utc)
-                            logger.info("Auto-close [Expired] #%d exit=%.3f P&L=$%.2f", trade.id, exit_price, pnl)
+                            logger.info("Auto-close [Redeemable] #%d exit=%.3f P&L=$%.2f", trade.id, exit_price, pnl)
                             continue
 
+                        # 2. Position not in trader's holdings → check CLOB for market closure
+                        if pos_info is None and trade.market_id in clob_resolution:
+                            res = clob_resolution[trade.market_id]
+                            exit_price = res["yes"] if side == "YES" else res["no"]
+                            entry = trade.price_entry or exit_price or 0.5
+                            size  = trade.amount_usdc or 0
+                            pnl   = size * ((exit_price - entry) / entry) if entry > 0 else -size
+                            trade.price_exit = exit_price
+                            trade.pnl_usd    = round(pnl, 4)
+                            trade.status     = "closed"
+                            trade.closed_at  = datetime.now(timezone.utc)
+                            logger.info("Auto-close [CLOB-closed] #%d %s exit=%.3f P&L=$%.2f",
+                                        trade.id, side, exit_price, pnl)
+                            continue
+
+                        # 3. TP / SL / fixed-target checks
                         if not tp and not sl and sell_mode != "fixed":
                             continue
-
-                        # Use trader's live position price; fall back to CLOB
                         cur_price = pos_info.get("cur_price") if pos_info else None
                         if cur_price is None:
                             cur_price = await self._get_price(client, trade.market_id)
@@ -374,6 +403,26 @@ class CopyEngine:
         except Exception as e:
             logger.warning("get_trader_positions error: %s", e)
             return {}
+
+    async def _get_clob_resolution(self, client: httpx.AsyncClient, condition_id: str) -> Optional[dict]:
+        """Check CLOB API if market is closed. Returns {yes, no} exit prices or None if still active.
+        tokens[0]=YES/Up, tokens[1]=NO/Down — consistent with outcomeIndex ordering."""
+        try:
+            r = await client.get(f"{CLOB_API}/markets/{condition_id}", headers=PM_HEADERS)
+            if not r.is_success:
+                return None
+            m = r.json()
+            if not m.get("closed"):
+                return None
+            tokens = m.get("tokens") or []
+            if len(tokens) < 2:
+                return None
+            return {
+                "yes": float(tokens[0].get("price", 0)),  # outcomeIndex=0 = YES/Up
+                "no":  float(tokens[1].get("price", 0)),  # outcomeIndex=1 = NO/Down
+            }
+        except Exception:
+            return None
 
     async def _get_price(self, client: httpx.AsyncClient, condition_id: str) -> Optional[float]:
         try:
