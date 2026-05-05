@@ -9,7 +9,7 @@ from routers import (
 )
 from routers import markets
 
-app = FastAPI(title="Polymarket CopyTrade API", version="3.2.0")
+app = FastAPI(title="Polymarket CopyTrade API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,20 +53,28 @@ async def startup():
 
 
 def _run_migrations():
-    """Lightweight incremental migrations for columns added after initial deploy."""
+    """Incremental schema migrations — safe to run on every startup (IF NOT EXISTS)."""
     from db import engine
+    import sqlalchemy as sa
+
+    migrations = [
+        # v3.5 — token_id for accurate CLOB midpoint lookups
+        "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS token_id VARCHAR",
+        # v4.0 — real-trading flags
+        "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS is_real BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS clob_order_id VARCHAR",
+    ]
+
     try:
         with engine.connect() as conn:
-            # v3.5: add token_id to copy_trades for accurate CLOB price lookups
-            conn.execute(
-                __import__("sqlalchemy").text(
-                    "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS token_id VARCHAR"
-                )
-            )
+            for sql in migrations:
+                try:
+                    conn.execute(sa.text(sql))
+                except Exception:
+                    pass  # SQLite / column already exists
             conn.commit()
     except Exception as e:
-        # SQLite or column already exists — safe to ignore
-        pass
+        pass  # non-blocking — app still starts
 
 
 def _ensure_default_user():
@@ -93,7 +101,7 @@ async def shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "3.4.0"}
+    return {"status": "ok", "version": "4.0.0"}
 
 
 @app.post("/api/admin/seed-user")

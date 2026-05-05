@@ -1,3 +1,19 @@
+"""
+services/copy_engine.py — v4.0
+================================
+Copy-trading engine with real CLOB execution.
+
+Trade lifecycle:
+  • Wallet configured on setting  → real market order placed on Polymarket CLOB
+    (is_real=True, clob_order_id stored)
+  • No wallet / CLOB order fails  → demo mode (is_real=False, status="demo")
+  • All closes (mirror, TP/SL)    → real SELL if is_real=True, else just DB update
+
+Engine loops:
+  _loop        → polls Data API for new trader activity every 10 s
+  _price_loop  → checks TP / SL / CLOB market closure every 30 s
+"""
+
 from typing import Optional
 import asyncio
 import httpx
@@ -13,9 +29,9 @@ PRICE_SECS = 30
 
 PM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    "Accept": "application/json",
-    "Origin": "https://polymarket.com",
-    "Referer": "https://polymarket.com/",
+    "Accept":     "application/json",
+    "Origin":     "https://polymarket.com",
+    "Referer":    "https://polymarket.com/",
 }
 
 
@@ -29,13 +45,17 @@ class CopyEngine:
         self.running     = True
         self._task       = asyncio.create_task(self._loop())
         self._price_task = asyncio.create_task(self._price_loop())
-        logger.info("Copy engine started")
+        logger.info("Copy engine v4.0 started")
 
     async def stop(self):
         self.running = False
         for t in [self._task, self._price_task]:
             if t:
                 t.cancel()
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Main poll loop
+    # ─────────────────────────────────────────────────────────────────────
 
     async def _loop(self):
         while self.running:
@@ -71,12 +91,16 @@ class CopyEngine:
         finally:
             db.close()
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  Trader activity check
+    # ─────────────────────────────────────────────────────────────────────
+
     async def _check_trader(self, client, db, addr, settings):
         try:
             r = await client.get(
                 f"{DATA_API}/activity",
                 params={"user": addr, "limit": 50},
-                headers=PM_HEADERS
+                headers=PM_HEADERS,
             )
             if not r.is_success:
                 return
@@ -90,13 +114,16 @@ class CopyEngine:
                     continue
                 new_max = max(int(t.get("timestamp", 0)) for t in new_trades)
                 self._set_watermark(db, setting, new_max)
-                # Process oldest-first so BUY is always handled before its REDEEM/SELL
                 new_trades_ordered = sorted(new_trades, key=lambda t: int(t.get("timestamp", 0)))
                 logger.info("%d new trades from %s", len(new_trades_ordered), addr[:10])
                 for trade in new_trades_ordered:
                     await self._process_trade(client, db, trade, setting)
         except Exception as e:
             logger.warning("Check trader error: %s", e)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Watermark helpers
+    # ─────────────────────────────────────────────────────────────────────
 
     def _get_watermark(self, db, setting):
         try:
@@ -106,9 +133,7 @@ class CopyEngine:
             ).first()
             return int(state.last_seen_ts) if state and state.last_seen_ts else 0
         except Exception:
-            if setting.updated_at:
-                return int(setting.updated_at.timestamp())
-            return 0
+            return int(setting.updated_at.timestamp()) if setting.updated_at else 0
 
     def _set_watermark(self, db, setting, ts):
         try:
@@ -120,85 +145,97 @@ class CopyEngine:
                 state.last_seen_ts = ts
                 db.commit()
             else:
-                new_state = CopyEngineState(setting_id=setting.id, last_seen_ts=ts)
-                db.add(new_state)
+                db.add(CopyEngineState(setting_id=setting.id, last_seen_ts=ts))
                 try:
                     db.commit()
                 except Exception:
                     db.rollback()
-                    # Row might have been inserted by concurrent tick — update instead
                     db.query(CopyEngineState).filter(
                         CopyEngineState.setting_id == setting.id
                     ).update({"last_seen_ts": ts})
                     db.commit()
         except Exception as e:
-            logger.error("Watermark save error: %s", e)
+            logger.error("Watermark error: %s", e)
             try:
                 db.rollback()
             except Exception:
                 pass
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  Process a single trader activity event
+    # ─────────────────────────────────────────────────────────────────────
+
     async def _process_trade(self, client, db, trade, setting):
         try:
             from models.copy_settings import CopyTrade
-            condition_id  = trade.get("conditionId") or trade.get("conditionId_") or trade.get("marketId") or ""
-            side_raw      = (trade.get("side") or "").upper()
-            trader_size   = float(trade.get("usdcSize") or trade.get("size") or trade.get("amount") or 0)
-            price         = float(trade.get("price") or trade.get("avgPrice") or 0.5)
-            market_title  = trade.get("title") or trade.get("market") or trade.get("question") or ""
-            outcome_index = int(trade.get("outcomeIndex") if trade.get("outcomeIndex") is not None else 0)
-            token_id      = trade.get("asset") or ""   # token_id for live price
-            trader_tx     = trade.get("transactionHash") or trade.get("txHash") or trade.get("hash") or ""
-            trade_type = (trade.get("type") or "TRADE").upper()
-            sl = getattr(setting, "stop_loss_pct", None)  # if SL set → mirror/fixed/manual disabled
-            logger.info("Trade: type=%s side=%s cid=%s size=%.2f tx=%s",
-                        trade_type, side_raw, condition_id[:12] if condition_id else "EMPTY", trader_size, trader_tx[:12] if trader_tx else "")
 
-            # MERGE = convert YES+NO→USDC, REDEEM = claim resolved market winnings
-            # Both mean the trader is exiting — mirror sell our open position.
-            # EXCEPTION: when SL is configured, only TP/SL auto-closes positions —
-            # mirror exits are disabled (per spec §6).
+            condition_id  = (trade.get("conditionId") or trade.get("conditionId_")
+                             or trade.get("marketId") or "")
+            side_raw      = (trade.get("side") or "").upper()
+            trader_size   = float(trade.get("usdcSize") or trade.get("size")
+                                  or trade.get("amount") or 0)
+            price         = float(trade.get("price") or trade.get("avgPrice") or 0.5)
+            market_title  = (trade.get("title") or trade.get("market")
+                             or trade.get("question") or "")
+            outcome_index = int(trade.get("outcomeIndex") if trade.get("outcomeIndex") is not None else 0)
+            token_id      = trade.get("asset") or ""
+            trader_tx     = (trade.get("transactionHash") or trade.get("txHash")
+                             or trade.get("hash") or "")
+            trade_type    = (trade.get("type") or "TRADE").upper()
+            sl            = getattr(setting, "stop_loss_pct", None)
+
+            logger.info("Trade: type=%s side=%s cid=%s size=%.2f tx=%s",
+                        trade_type, side_raw,
+                        condition_id[:12] if condition_id else "EMPTY",
+                        trader_size,
+                        trader_tx[:12] if trader_tx else "")
+
+            # ── MERGE / REDEEM ──────────────────────────────────────────
+            # Trader is exiting. Mirror only when SL is NOT set.
             if trade_type in ("MERGE", "REDEEM"):
                 if condition_id and not sl:
                     sell_mode = getattr(setting, "sell_mode", "mirror")
                     if sell_mode in ("mirror", "sell_all"):
                         if trade_type == "REDEEM":
-                            # REDEEM = market resolved, winning share = $1
                             exit_price = 1.0
                         else:
-                            # MERGE: try live midpoint from CLOB, fall back to event price
                             asset = trade.get("asset") or ""
-                            live = await self._get_price(client, asset) if asset else None
+                            live  = await self._get_price(client, asset) if asset else None
                             exit_price = live if live is not None else (price if price > 0 else 1.0)
-                        await self._mirror_sell(db, setting, condition_id, exit_price)
+                        await self._close_positions(db, setting, condition_id, exit_price,
+                                                    reason="mirror")
                 return
 
             if trade_type != "TRADE":
                 return
             if not condition_id or trader_size <= 0:
-                logger.warning("Skipping trade: empty cid=%r or size=%.2f — keys=%s",
-                               condition_id, trader_size, list(trade.keys()))
+                logger.warning("Skipping: empty cid=%r or size=%.2f", condition_id, trader_size)
                 return
-            # Determine YES/NO: prefer explicit "outcome" field over outcomeIndex
-            outcome_str = (trade.get("outcome") or "").strip().upper()
+
+            # ── Determine YES / NO ──────────────────────────────────────
+            outcome_str   = (trade.get("outcome") or "").strip().upper()
             if outcome_str in ("YES", "Y"):
                 outcome_is_yes = True
             elif outcome_str in ("NO", "N"):
                 outcome_is_yes = False
             else:
-                outcome_is_yes = (outcome_index == 0)  # fallback: 0=YES, 1=NO
-            if side_raw == "BUY":
-                our_side = "YES" if outcome_is_yes else "NO"
-            elif side_raw == "SELL":
-                # When SL is configured, trader-SELL events don't trigger our mirror exit
-                # (only TP/SL auto-closes are active — per spec §6).
+                outcome_is_yes = (outcome_index == 0)
+
+            # ── SELL side ───────────────────────────────────────────────
+            if side_raw == "SELL":
                 if not sl:
                     sell_mode = getattr(setting, "sell_mode", "mirror")
                     if sell_mode in ("mirror", "sell_all"):
-                        await self._mirror_sell(db, setting, condition_id, price)
+                        await self._close_positions(db, setting, condition_id, price,
+                                                    reason="mirror")
                 return
-            else:
-                our_side = "YES"
+
+            # ── BUY side ────────────────────────────────────────────────
+            if side_raw != "BUY":
+                return
+
+            our_side = "YES" if outcome_is_yes else "NO"
+
             # Dedup: skip if this tx_hash already saved for this setting
             if trader_tx:
                 dup = db.query(CopyTrade).filter(
@@ -207,30 +244,60 @@ class CopyEngine:
                 ).first()
                 if dup:
                     return
-            copy_size = self._calc_size(trader_size, setting, db=db)
+
+            # ── Guards ──────────────────────────────────────────────────
+            wallet    = await self._get_wallet_for_setting(db, setting)
+            copy_size = await self._calc_size(trader_size, setting, db, wallet)
             if copy_size < 1.0:
                 return
-            if not await self._check_budget(db, setting, copy_size):
+            if not await self._check_budget(db, setting):
                 return
             if not await self._check_daily_trades(db, setting):
                 return
+
+            # ── Execute BUY ─────────────────────────────────────────────
+            is_real       = False
+            clob_order_id = None
+            entry_price   = price
+
+            if wallet and getattr(wallet, "encrypted_private_key", None) and token_id:
+                from services.clob import execute_buy
+                logger.info("Executing REAL BUY: $%.2f token=%s", copy_size, token_id[:12])
+                result = await execute_buy(
+                    wallet.encrypted_private_key, token_id, copy_size, price
+                )
+                if result["success"]:
+                    is_real       = True
+                    entry_price   = result.get("fill_price") or price
+                    clob_order_id = result.get("order_id") or None
+                    logger.info("Real BUY filled: price=%.4f order=%s",
+                                entry_price, clob_order_id)
+                else:
+                    logger.warning("Real BUY failed (%s) — falling back to demo",
+                                   result.get("error"))
+
             t_obj = CopyTrade(
-                user_id=setting.user_id,
-                copy_settings_id=setting.id,
-                trader_address=setting.trader_address,
-                market_id=condition_id,
-                token_id=token_id or None,   # store YES/NO token_id for accurate CLOB price lookups
-                market_question=market_title,
-                side=our_side,
-                amount_usdc=copy_size,
-                price_entry=price,
-                status="demo",
-                tx_hash=trader_tx,
+                user_id          = setting.user_id,
+                copy_settings_id = setting.id,
+                trader_address   = setting.trader_address,
+                market_id        = condition_id,
+                token_id         = token_id or None,
+                market_question  = market_title,
+                side             = our_side,
+                amount_usdc      = copy_size,
+                price_entry      = entry_price,
+                is_real          = is_real,
+                clob_order_id    = clob_order_id,
+                status           = "demo",
+                tx_hash          = trader_tx,
             )
             db.add(t_obj)
             db.commit()
             db.refresh(t_obj)
-            logger.info("Demo trade #%d: %s $%.2f | %s", t_obj.id, our_side, copy_size, market_title[:30])
+            mode = "REAL" if is_real else "DEMO"
+            logger.info("[%s] Trade #%d: %s $%.2f | %s",
+                        mode, t_obj.id, our_side, copy_size, market_title[:30])
+
         except Exception as e:
             logger.error("Process trade error: %s", e)
             try:
@@ -238,25 +305,72 @@ class CopyEngine:
             except Exception:
                 pass
 
-    async def _mirror_sell(self, db, setting, condition_id, price):
+    # ─────────────────────────────────────────────────────────────────────
+    #  Close positions (mirror sell / TP / SL / CLOB-resolved)
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _close_positions(self, db, setting, condition_id: str,
+                               exit_price: float, reason: str = ""):
+        """Close all open demo positions for a given market.
+        For is_real positions, execute a real SELL on CLOB first."""
         try:
             from models.copy_settings import CopyTrade
+
             open_trades = db.query(CopyTrade).filter(
                 CopyTrade.copy_settings_id == setting.id,
-                CopyTrade.market_id == condition_id,
-                CopyTrade.status == "demo"
+                CopyTrade.market_id        == condition_id,
+                CopyTrade.status           == "demo",
             ).all()
+
+            if not open_trades:
+                return
+
+            wallet = await self._get_wallet_for_setting(db, setting)
+
             for t in open_trades:
-                entry = t.price_entry or price
-                pnl   = t.amount_usdc * ((price - entry) / entry) if entry > 0 else 0
-                t.price_exit = price
+                actual_exit = exit_price
+
+                # Real position — try to execute a sell on CLOB
+                if t.is_real and wallet and t.token_id:
+                    from services.clob import execute_sell
+                    entry  = t.price_entry or exit_price or 0.5
+                    shares = t.amount_usdc / entry if entry > 0 else 0
+                    if shares > 0:
+                        result = await execute_sell(
+                            wallet.encrypted_private_key, t.token_id, shares, exit_price
+                        )
+                        if result["success"]:
+                            actual_exit   = result.get("fill_price") or exit_price
+                            t.clob_order_id = result.get("order_id") or t.clob_order_id
+                            logger.info("Real SELL [%s] #%d exit=%.4f", reason, t.id, actual_exit)
+                        else:
+                            logger.warning("Real SELL failed [%s] #%d: %s — using DB exit price",
+                                           reason, t.id, result.get("error"))
+
+                entry = t.price_entry or actual_exit
+                pnl   = t.amount_usdc * ((actual_exit - entry) / entry) if entry > 0 else 0
+                t.price_exit = actual_exit
                 t.pnl_usd    = round(pnl, 4)
                 t.status     = "closed"
                 t.closed_at  = datetime.now(timezone.utc)
-            if open_trades:
-                db.commit()
+                logger.info("Close [%s] #%d exit=%.4f PnL=$%.2f", reason, t.id, actual_exit, pnl)
+
+            db.commit()
+
         except Exception as e:
-            logger.error("Mirror-sell error: %s", e)
+            logger.error("_close_positions error: %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    # Keep old name as alias (called by router/scan endpoint)
+    async def _mirror_sell(self, db, setting, condition_id, price):
+        await self._close_positions(db, setting, condition_id, price, reason="mirror")
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Price loop — TP / SL / CLOB market closure
+    # ─────────────────────────────────────────────────────────────────────
 
     async def _price_loop(self):
         while self.running:
@@ -272,6 +386,7 @@ class CopyEngine:
             from models.copy_settings import CopySettings, CopyTrade
         except ImportError:
             return
+
         db = SessionLocal()
         try:
             settings = db.query(CopySettings).filter(
@@ -279,11 +394,12 @@ class CopyEngine:
             ).all()
             if not settings:
                 return
+
             async with httpx.AsyncClient(timeout=15) as client:
                 for setting in settings:
                     open_trades = db.query(CopyTrade).filter(
                         CopyTrade.copy_settings_id == setting.id,
-                        CopyTrade.status == "demo"
+                        CopyTrade.status           == "demo",
                     ).all()
                     if not open_trades:
                         continue
@@ -292,66 +408,52 @@ class CopyEngine:
                     tp        = setting.take_profit_pct
                     sl        = setting.stop_loss_pct
                     sell_mode = setting.sell_mode or "mirror"
+                    wallet    = await self._get_wallet_for_setting(db, setting)
 
-                    # Batch CLOB resolution check for trades NOT found in trader's positions.
-                    # Needed because high-frequency traders (like bjprolo) can have 500+
-                    # unredeemed old positions — the positions API limit hides new markets.
-                    unresolved_cids = set()
+                    # CLOB resolution batch for trades not in trader's positions
+                    unresolved_cids: set = set()
                     for trade in open_trades:
                         cid = (trade.market_id or "").lower()
-                        pos = trader_pos.get(cid) or trader_pos.get(trade.market_id or "")
-                        if pos is None and trade.market_id:
-                            unresolved_cids.add(trade.market_id)
+                        if not (trader_pos.get(cid) or trader_pos.get(trade.market_id or "")):
+                            if trade.market_id:
+                                unresolved_cids.add(trade.market_id)
 
-                    clob_resolution = {}  # conditionId → exit_price_for_side
+                    clob_resolution: dict = {}
                     for cid in unresolved_cids:
                         res = await self._get_clob_resolution(client, cid)
                         if res is not None:
-                            clob_resolution[cid] = res  # {yes_price, no_price}
+                            clob_resolution[cid] = res
 
                     for trade in open_trades:
-                        cid = (trade.market_id or "").lower()
-                        pos_info = trader_pos.get(cid) or trader_pos.get(trade.market_id or "")
+                        cid      = (trade.market_id or "").lower()
+                        pos_info = (trader_pos.get(cid)
+                                    or trader_pos.get(trade.market_id or ""))
                         side = (trade.side or "YES").upper()
 
-                        # 1. Trader's position is redeemable (market resolved, not yet claimed)
+                        # ── Level 1: redeemable position ─────────────────
                         if pos_info and pos_info.get("redeemable"):
-                            raw_ep = pos_info.get("cur_price")
+                            raw_ep     = pos_info.get("cur_price")
                             exit_price = float(raw_ep) if raw_ep is not None else 0.0
-                            entry = trade.price_entry or exit_price or 0.5
-                            size  = trade.amount_usdc or 0
-                            pnl   = size * ((exit_price - entry) / entry) if entry > 0 else -size
-                            trade.price_exit = exit_price
-                            trade.pnl_usd    = round(pnl, 4)
-                            trade.status     = "closed"
-                            trade.closed_at  = datetime.now(timezone.utc)
-                            logger.info("Auto-close [Redeemable] #%d exit=%.3f P&L=$%.2f", trade.id, exit_price, pnl)
+                            await self._close_one(db, trade, exit_price, "Redeemable",
+                                                  wallet)
                             continue
 
-                        # 2. Position not in trader's holdings → check CLOB for market closure
+                        # ── Level 2: CLOB says market is closed ──────────
                         if pos_info is None and trade.market_id in clob_resolution:
-                            res = clob_resolution[trade.market_id]
+                            res        = clob_resolution[trade.market_id]
                             exit_price = res["yes"] if side == "YES" else res["no"]
-                            entry = trade.price_entry or exit_price or 0.5
-                            size  = trade.amount_usdc or 0
-                            pnl   = size * ((exit_price - entry) / entry) if entry > 0 else -size
-                            trade.price_exit = exit_price
-                            trade.pnl_usd    = round(pnl, 4)
-                            trade.status     = "closed"
-                            trade.closed_at  = datetime.now(timezone.utc)
-                            logger.info("Auto-close [CLOB-closed] #%d %s exit=%.3f P&L=$%.2f",
-                                        trade.id, side, exit_price, pnl)
+                            await self._close_one(db, trade, exit_price, "CLOB-closed",
+                                                  wallet)
                             continue
 
-                        # 3. TP / SL / fixed-target checks
+                        # ── Level 3: TP / SL / fixed ─────────────────────
                         if not tp and not sl and sell_mode != "fixed":
                             continue
+
                         cur_price = pos_info.get("cur_price") if pos_info else None
                         if cur_price is None:
-                            # Use stored token_id for accurate CLOB midpoint lookup;
-                            # fall back to conditionId (less reliable but better than nothing)
-                            price_lookup_id = trade.token_id or trade.market_id
-                            cur_price = await self._get_price(client, price_lookup_id)
+                            pid = trade.token_id or trade.market_id
+                            cur_price = await self._get_price(client, pid)
                         if cur_price is None:
                             continue
 
@@ -359,6 +461,7 @@ class CopyEngine:
                         size    = trade.amount_usdc or 0
                         pnl_pct = ((cur_price - entry) / entry * 100) if entry > 0 else 0
                         cur_val = size * (cur_price / entry) if entry > 0 else size
+
                         triggered = False
                         reason    = ""
                         if tp and pnl_pct >= float(tp):
@@ -368,32 +471,63 @@ class CopyEngine:
                             triggered = True
                             reason    = "SL"
                         elif sell_mode == "fixed" and not sl:
-                            # Fixed sell-mode disabled when SL is configured (spec §6)
                             target = setting.entry_amount
                             if target and cur_val >= float(target):
                                 triggered = True
                                 reason    = "Fixed"
+
                         if triggered:
-                            pnl = size * ((cur_price - entry) / entry) if entry > 0 else 0
-                            trade.price_exit = cur_price
-                            trade.pnl_usd    = round(pnl, 4)
-                            trade.status     = "closed"
-                            trade.closed_at  = datetime.now(timezone.utc)
-                            logger.info("Auto-close [%s] #%d P&L=$%.2f", reason, trade.id, pnl)
+                            await self._close_one(db, trade, cur_price, reason, wallet)
+
             db.commit()
+
         except Exception as e:
             logger.error("TP/SL error: %s", e)
         finally:
             db.close()
 
-    async def _get_trader_positions(self, client: httpx.AsyncClient, trader_address: str) -> dict:
-        """Fetch trader's live positions from Data API.
-        Returns dict keyed by conditionId (lowercase) with {cur_price, redeemable}."""
+    async def _close_one(self, db, trade, exit_price: float,
+                         reason: str, wallet=None):
+        """Close a single CopyTrade — executes real SELL if is_real=True."""
+        try:
+            actual_exit = exit_price
+
+            if trade.is_real and wallet and trade.token_id:
+                from services.clob import execute_sell
+                entry  = trade.price_entry or exit_price or 0.5
+                shares = trade.amount_usdc / entry if entry > 0 else 0
+                if shares > 0:
+                    result = await execute_sell(
+                        wallet.encrypted_private_key, trade.token_id, shares, exit_price
+                    )
+                    if result["success"]:
+                        actual_exit       = result.get("fill_price") or exit_price
+                        trade.clob_order_id = result.get("order_id") or trade.clob_order_id
+                    else:
+                        logger.warning("Real SELL failed [%s] #%d: %s",
+                                       reason, trade.id, result.get("error"))
+
+            entry = trade.price_entry or actual_exit
+            pnl   = trade.amount_usdc * ((actual_exit - entry) / entry) if entry > 0 else 0
+            trade.price_exit = actual_exit
+            trade.pnl_usd    = round(pnl, 4)
+            trade.status     = "closed"
+            trade.closed_at  = datetime.now(timezone.utc)
+            logger.info("Close [%s] #%d exit=%.4f PnL=$%.2f", reason, trade.id, actual_exit, pnl)
+
+        except Exception as e:
+            logger.error("_close_one error [%s] #%d: %s", reason, trade.id, e)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Polymarket data helpers
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _get_trader_positions(self, client, trader_address: str) -> dict:
         try:
             r = await client.get(
                 f"{DATA_API}/positions",
                 params={"user": trader_address, "limit": 500, "closed": "false"},
-                headers=PM_HEADERS
+                headers=PM_HEADERS,
             )
             if not r.is_success:
                 return {}
@@ -415,9 +549,8 @@ class CopyEngine:
             logger.warning("get_trader_positions error: %s", e)
             return {}
 
-    async def _get_clob_resolution(self, client: httpx.AsyncClient, condition_id: str) -> Optional[dict]:
-        """Check CLOB API if market is closed. Returns {yes, no} exit prices or None if still active.
-        tokens[0]=YES/Up, tokens[1]=NO/Down — consistent with outcomeIndex ordering."""
+    async def _get_clob_resolution(self, client, condition_id: str) -> Optional[dict]:
+        """Returns {yes, no} prices if market is closed on CLOB, else None."""
         try:
             r = await client.get(f"{CLOB_API}/markets/{condition_id}", headers=PM_HEADERS)
             if not r.is_success:
@@ -429,15 +562,16 @@ class CopyEngine:
             if len(tokens) < 2:
                 return None
             return {
-                "yes": float(tokens[0].get("price", 0)),  # outcomeIndex=0 = YES/Up
-                "no":  float(tokens[1].get("price", 0)),  # outcomeIndex=1 = NO/Down
+                "yes": float(tokens[0].get("price", 0)),
+                "no":  float(tokens[1].get("price", 0)),
             }
         except Exception:
             return None
 
-    async def _get_price(self, client: httpx.AsyncClient, condition_id: str) -> Optional[float]:
+    async def _get_price(self, client, token_id: str) -> Optional[float]:
+        """Fetch midpoint price for a YES/NO token from CLOB."""
         try:
-            r = await client.get(f"{CLOB_API}/midpoint", params={"token_id": condition_id})
+            r = await client.get(f"{CLOB_API}/midpoint", params={"token_id": token_id})
             if r.is_success:
                 val = r.json().get("mid", 0)
                 return float(val) if val else None
@@ -445,30 +579,88 @@ class CopyEngine:
             pass
         return None
 
-    def _calc_size(self, trader_size: float, setting, db=None) -> float:
-        """Calculate our copy position size.
-        fixed:   always entry_amount USD regardless of trader's size.
-        percent: entry_amount% of our portfolio (open positions sum + base $100).
-                 db is required for an accurate portfolio total; falls back to $100.
+    # ─────────────────────────────────────────────────────────────────────
+    #  Wallet lookup
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _get_wallet_for_setting(self, db, setting):
+        """
+        Returns the Wallet DB object for this copy setting, or None.
+        Priority: dedicated wallet (wallet_address) → default wallet → None.
+        """
+        try:
+            from models.wallet import Wallet
+
+            if setting.wallet_address:
+                w = db.query(Wallet).filter(
+                    Wallet.address == setting.wallet_address
+                ).first()
+                if w and w.encrypted_private_key:
+                    return w
+
+            # Fall back to the user's default wallet
+            w = db.query(Wallet).filter(
+                Wallet.user_id    == setting.user_id,
+                Wallet.is_default == True,
+            ).first()
+            return w if (w and w.encrypted_private_key) else None
+
+        except Exception as e:
+            logger.debug("_get_wallet_for_setting error: %s", e)
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Size calculation
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _calc_size(self, trader_size: float, setting, db=None,
+                         wallet=None) -> float:
+        """
+        fixed:   entry_amount USD, regardless of trader's position size.
+        percent: entry_amount% of portfolio.
+                 portfolio = real wallet USDC balance (if wallet known)
+                            + value of all open positions for this setting.
+                 Falls back to $100 base if wallet balance unavailable.
         """
         mode = getattr(setting, "entry_mode", "fixed") or "fixed"
         amt  = float(getattr(setting, "entry_amount", 10) or 10)
-        if mode == "percent":
-            portfolio_size = 100.0  # base demo portfolio
-            if db is not None:
-                try:
-                    from models.copy_settings import CopyTrade
-                    open_val = db.query(CopyTrade).filter(
-                        CopyTrade.copy_settings_id == setting.id,
-                        CopyTrade.status == "demo",
-                    ).all()
-                    portfolio_size += sum(t.amount_usdc or 0 for t in open_val)
-                except Exception:
-                    pass
-            return portfolio_size * (amt / 100)
-        return amt
 
-    async def _check_budget(self, db, setting, needed: float) -> bool:
+        if mode != "percent":
+            return amt
+
+        # ── Percent mode: build portfolio_size ───────────────────────────
+        portfolio_size = 100.0  # base / fallback
+
+        # Real wallet USDC balance (blocking RPC call in thread)
+        if wallet and getattr(wallet, "address", None):
+            try:
+                from services.wallet_service import get_usdc_balance
+                balance = await asyncio.to_thread(get_usdc_balance, wallet.address)
+                portfolio_size = float(balance)
+                logger.debug("Wallet %s USDC balance: $%.2f", wallet.address[:10], portfolio_size)
+            except Exception as e:
+                logger.debug("Balance fetch failed: %s — using $100 base", e)
+
+        # Add open-position value
+        if db is not None:
+            try:
+                from models.copy_settings import CopyTrade
+                open_val = db.query(CopyTrade).filter(
+                    CopyTrade.copy_settings_id == setting.id,
+                    CopyTrade.status           == "demo",
+                ).all()
+                portfolio_size += sum(t.amount_usdc or 0 for t in open_val)
+            except Exception:
+                pass
+
+        return portfolio_size * (amt / 100)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Daily guards
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _check_budget(self, db, setting) -> bool:
+        """Stop opening new trades when today's cumulative loss hits the limit."""
         max_loss = getattr(setting, "max_daily_loss_usd", None)
         if not max_loss:
             return True
@@ -479,21 +671,21 @@ class CopyEngine:
             )
             closed_today = db.query(CopyTrade).filter(
                 CopyTrade.copy_settings_id == setting.id,
-                CopyTrade.status == "closed",
-                CopyTrade.closed_at >= today_start,
-                CopyTrade.pnl_usd < 0,
+                CopyTrade.status           == "closed",
+                CopyTrade.closed_at        >= today_start,
+                CopyTrade.pnl_usd          < 0,
             ).all()
             daily_loss = abs(sum(t.pnl_usd or 0 for t in closed_today))
             if daily_loss >= float(max_loss):
-                logger.warning("Setting %d auto-stopped: daily loss limit reached", setting.id)
+                logger.warning("Setting %d: daily loss limit $%.2f reached", setting.id, daily_loss)
                 return False
             return True
         except Exception:
             return True
 
     async def _check_daily_trades(self, db, setting) -> bool:
-        """Daily BUY cap: once N trades have been OPENED today (UTC), stop opening new ones.
-        Resets automatically at UTC midnight — sells/closes always continue regardless."""
+        """Stop opening new trades when today's BUY count hits the daily cap.
+        Resets at UTC midnight. Sell/close operations are never blocked."""
         max_daily = getattr(setting, "max_daily_trades", None)
         if not max_daily:
             return True
@@ -504,8 +696,8 @@ class CopyEngine:
             )
             count = db.query(CopyTrade).filter(
                 CopyTrade.copy_settings_id == setting.id,
-                CopyTrade.opened_at >= today_start,  # opened today (UTC)
-                CopyTrade.status.in_(["demo", "closed"]),  # count both open and closed
+                CopyTrade.opened_at        >= today_start,
+                CopyTrade.status.in_(["demo", "closed"]),
             ).count()
             return count < int(max_daily)
         except Exception:

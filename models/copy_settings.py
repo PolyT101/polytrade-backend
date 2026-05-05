@@ -89,8 +89,10 @@ class CopyTrade(Base):
     price_entry        = Column(Float, nullable=True)
     price_exit         = Column(Float, nullable=True)
     pnl_usd            = Column(Float, nullable=True)
-    status             = Column(String, default="demo")  # demo | open | closed | cancelled
-    tx_hash            = Column(String, nullable=True)
+    status             = Column(String, default="demo")  # demo | closed
+    is_real            = Column(Boolean, default=False)   # True = real CLOB order was placed
+    clob_order_id      = Column(String, nullable=True)    # CLOB orderID for tracking
+    tx_hash            = Column(String, nullable=True)    # trader's tx hash (for dedup)
     opened_at          = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at          = Column(DateTime, nullable=True)
 

@@ -194,9 +194,10 @@ async def update_setting(setting_id: int, data: CopySettingIn, user_id: str = "1
 
 @router.post("/settings/{setting_id}/sell-all")
 async def sell_all_positions(setting_id: int, user_id: str = "1"):
-    """מכור את כל הפוזיציות הפתוחות של קופי ספציפי במחיר שוק נוכחי."""
+    """מכור את כל הפוזיציות הפתוחות — real CLOB sell for is_real positions."""
     from db import SessionLocal
     from models.copy_settings import CopySettings, CopyTrade
+    from models.wallet import Wallet
     from datetime import datetime, timezone
     CLOB = "https://clob.polymarket.com"
     PM_H = {
@@ -219,16 +220,30 @@ async def sell_all_positions(setting_id: int, user_id: str = "1"):
         ).all()
         if not open_trades:
             return {"success": True, "closed": 0}
+
+        # Resolve wallet once for this setting
+        wallet = None
+        if s.wallet_address:
+            wallet = db.query(Wallet).filter(Wallet.address == s.wallet_address).first()
+        if not wallet:
+            wallet = db.query(Wallet).filter(
+                Wallet.user_id == user_id, Wallet.is_default == True
+            ).first()
+
         closed_count = 0
-        now = datetime.now(timezone.utc)
-        async with httpx.AsyncClient(timeout=15) as client:
+        real_count   = 0
+        now          = datetime.now(timezone.utc)
+
+        async with httpx.AsyncClient(timeout=15) as http_client:
             for t in open_trades:
-                cur_price = None
-                if t.market_id:
+                # Fetch current midpoint price (use token_id if available, else market_id)
+                cur_price   = None
+                price_token = t.token_id or t.market_id
+                if price_token:
                     try:
-                        r = await client.get(
+                        r = await http_client.get(
                             f"{CLOB}/midpoint",
-                            params={"token_id": t.market_id},
+                            params={"token_id": price_token},
                             headers=PM_H
                         )
                         if r.is_success:
@@ -238,16 +253,34 @@ async def sell_all_positions(setting_id: int, user_id: str = "1"):
                         pass
                 if cur_price is None:
                     cur_price = t.price_entry or 0.5
-                entry = t.price_entry or cur_price
+
+                actual_exit = cur_price
+
+                # Real position — execute CLOB sell
+                if t.is_real and wallet and t.token_id:
+                    from services.clob import execute_sell
+                    entry  = t.price_entry or cur_price or 0.5
+                    shares = t.amount_usdc / entry if entry > 0 else 0
+                    if shares > 0:
+                        result = await execute_sell(
+                            wallet.encrypted_private_key, t.token_id, shares, cur_price
+                        )
+                        if result["success"]:
+                            actual_exit = result.get("fill_price") or cur_price
+                            real_count += 1
+                        # On fail: still close in DB at fetched price
+
+                entry = t.price_entry or actual_exit
                 size  = t.amount_usdc or 0
-                pnl   = size * ((cur_price - entry) / entry) if entry > 0 else 0
-                t.price_exit = cur_price
+                pnl   = size * ((actual_exit - entry) / entry) if entry > 0 else 0
+                t.price_exit = actual_exit
                 t.pnl_usd    = round(pnl, 4)
                 t.status     = "closed"
                 t.closed_at  = now
                 closed_count += 1
+
         db.commit()
-        return {"success": True, "closed": closed_count}
+        return {"success": True, "closed": closed_count, "real_executed": real_count}
     except HTTPException:
         raise
     except Exception as e:
@@ -578,12 +611,15 @@ def _fmt_trade(t) -> dict:
         "copy_settings_id": t.copy_settings_id,
         "market":           t.market_question,
         "market_id":        t.market_id,
+        "token_id":         t.token_id,
         "side":             t.side,
         "amount":           t.amount_usdc,
         "price_entry":      t.price_entry,
         "price_exit":       t.price_exit,
         "pnl":              t.pnl_usd,
         "status":           t.status,
+        "is_real":          getattr(t, "is_real", False) or False,
+        "clob_order_id":    getattr(t, "clob_order_id", None),
         "tx_hash":          t.tx_hash,
         "opened_at":        str(t.opened_at) if t.opened_at else None,
         "closed_at":        str(t.closed_at) if t.closed_at else None,
