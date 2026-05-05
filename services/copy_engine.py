@@ -150,13 +150,16 @@ class CopyEngine:
             token_id      = trade.get("asset") or ""   # token_id for live price
             trader_tx     = trade.get("transactionHash") or trade.get("txHash") or trade.get("hash") or ""
             trade_type = (trade.get("type") or "TRADE").upper()
+            sl = getattr(setting, "stop_loss_pct", None)  # if SL set → mirror/fixed/manual disabled
             logger.info("Trade: type=%s side=%s cid=%s size=%.2f tx=%s",
                         trade_type, side_raw, condition_id[:12] if condition_id else "EMPTY", trader_size, trader_tx[:12] if trader_tx else "")
 
             # MERGE = convert YES+NO→USDC, REDEEM = claim resolved market winnings
-            # Both mean the trader is exiting — mirror sell our open position
+            # Both mean the trader is exiting — mirror sell our open position.
+            # EXCEPTION: when SL is configured, only TP/SL auto-closes positions —
+            # mirror exits are disabled (per spec §6).
             if trade_type in ("MERGE", "REDEEM"):
-                if condition_id:
+                if condition_id and not sl:
                     sell_mode = getattr(setting, "sell_mode", "mirror")
                     if sell_mode in ("mirror", "sell_all"):
                         if trade_type == "REDEEM":
@@ -187,9 +190,12 @@ class CopyEngine:
             if side_raw == "BUY":
                 our_side = "YES" if outcome_is_yes else "NO"
             elif side_raw == "SELL":
-                sell_mode = getattr(setting, "sell_mode", "mirror")
-                if sell_mode in ("mirror", "sell_all"):
-                    await self._mirror_sell(db, setting, condition_id, price)
+                # When SL is configured, trader-SELL events don't trigger our mirror exit
+                # (only TP/SL auto-closes are active — per spec §6).
+                if not sl:
+                    sell_mode = getattr(setting, "sell_mode", "mirror")
+                    if sell_mode in ("mirror", "sell_all"):
+                        await self._mirror_sell(db, setting, condition_id, price)
                 return
             else:
                 our_side = "YES"
@@ -201,7 +207,7 @@ class CopyEngine:
                 ).first()
                 if dup:
                     return
-            copy_size = self._calc_size(trader_size, setting)
+            copy_size = self._calc_size(trader_size, setting, db=db)
             if copy_size < 1.0:
                 return
             if not await self._check_budget(db, setting, copy_size):
@@ -357,7 +363,8 @@ class CopyEngine:
                         elif sl and pnl_pct <= -float(sl):
                             triggered = True
                             reason    = "SL"
-                        elif sell_mode == "fixed":
+                        elif sell_mode == "fixed" and not sl:
+                            # Fixed sell-mode disabled when SL is configured (spec §6)
                             target = setting.entry_amount
                             if target and cur_val >= float(target):
                                 triggered = True
@@ -434,11 +441,27 @@ class CopyEngine:
             pass
         return None
 
-    def _calc_size(self, trader_size: float, setting) -> float:
+    def _calc_size(self, trader_size: float, setting, db=None) -> float:
+        """Calculate our copy position size.
+        fixed:   always entry_amount USD regardless of trader's size.
+        percent: entry_amount% of our portfolio (open positions sum + base $100).
+                 db is required for an accurate portfolio total; falls back to $100.
+        """
         mode = getattr(setting, "entry_mode", "fixed") or "fixed"
         amt  = float(getattr(setting, "entry_amount", 10) or 10)
         if mode == "percent":
-            return trader_size * (amt / 100)
+            portfolio_size = 100.0  # base demo portfolio
+            if db is not None:
+                try:
+                    from models.copy_settings import CopyTrade
+                    open_val = db.query(CopyTrade).filter(
+                        CopyTrade.copy_settings_id == setting.id,
+                        CopyTrade.status == "demo",
+                    ).all()
+                    portfolio_size += sum(t.amount_usdc or 0 for t in open_val)
+                except Exception:
+                    pass
+            return portfolio_size * (amt / 100)
         return amt
 
     async def _check_budget(self, db, setting, needed: float) -> bool:
@@ -465,6 +488,8 @@ class CopyEngine:
             return True
 
     async def _check_daily_trades(self, db, setting) -> bool:
+        """Daily BUY cap: once N trades have been OPENED today (UTC), stop opening new ones.
+        Resets automatically at UTC midnight — sells/closes always continue regardless."""
         max_daily = getattr(setting, "max_daily_trades", None)
         if not max_daily:
             return True
@@ -475,8 +500,8 @@ class CopyEngine:
             )
             count = db.query(CopyTrade).filter(
                 CopyTrade.copy_settings_id == setting.id,
-                CopyTrade.status == "demo",   # only count open positions, not closed ones
-                CopyTrade.opened_at >= today_start,
+                CopyTrade.opened_at >= today_start,  # opened today (UTC)
+                CopyTrade.status.in_(["demo", "closed"]),  # count both open and closed
             ).count()
             return count < int(max_daily)
         except Exception:

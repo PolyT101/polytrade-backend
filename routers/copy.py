@@ -192,6 +192,71 @@ async def update_setting(setting_id: int, data: CopySettingIn, user_id: str = "1
         db.close()
 
 
+@router.post("/settings/{setting_id}/sell-all")
+async def sell_all_positions(setting_id: int, user_id: str = "1"):
+    """מכור את כל הפוזיציות הפתוחות של קופי ספציפי במחיר שוק נוכחי."""
+    from db import SessionLocal
+    from models.copy_settings import CopySettings, CopyTrade
+    from datetime import datetime, timezone
+    CLOB = "https://clob.polymarket.com"
+    PM_H = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Origin": "https://polymarket.com",
+        "Referer": "https://polymarket.com/",
+    }
+    db = SessionLocal()
+    try:
+        s = db.query(CopySettings).filter(
+            CopySettings.id == setting_id,
+            CopySettings.user_id == user_id
+        ).first()
+        if not s:
+            raise HTTPException(404, "לא נמצא")
+        open_trades = db.query(CopyTrade).filter(
+            CopyTrade.copy_settings_id == setting_id,
+            CopyTrade.status == "demo"
+        ).all()
+        if not open_trades:
+            return {"success": True, "closed": 0}
+        closed_count = 0
+        now = datetime.now(timezone.utc)
+        async with httpx.AsyncClient(timeout=15) as client:
+            for t in open_trades:
+                cur_price = None
+                if t.market_id:
+                    try:
+                        r = await client.get(
+                            f"{CLOB}/midpoint",
+                            params={"token_id": t.market_id},
+                            headers=PM_H
+                        )
+                        if r.is_success:
+                            mid = r.json().get("mid", 0)
+                            cur_price = float(mid) if mid else None
+                    except Exception:
+                        pass
+                if cur_price is None:
+                    cur_price = t.price_entry or 0.5
+                entry = t.price_entry or cur_price
+                size  = t.amount_usdc or 0
+                pnl   = size * ((cur_price - entry) / entry) if entry > 0 else 0
+                t.price_exit = cur_price
+                t.pnl_usd    = round(pnl, 4)
+                t.status     = "closed"
+                t.closed_at  = now
+                closed_count += 1
+        db.commit()
+        return {"success": True, "closed": closed_count}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
 @router.post("/settings/{setting_id}/activate")
 async def resume_copy(setting_id: int, user_id: str = "1"):
     """הפעלה מחדש של קופי שהופסק."""
