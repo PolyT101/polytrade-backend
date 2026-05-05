@@ -1,12 +1,14 @@
 """
 routers/wallets.py
 ------------------
-GET    /api/wallets/{user_id}              — כל הארנקים של משתמש + יתרות
-POST   /api/wallets/{user_id}/create       — צור ארנק חדש
-PATCH  /api/wallets/{wallet_id}/label      — שנה שם ארנק
-PATCH  /api/wallets/{wallet_id}/set-default — קבע ברירת מחדל
-POST   /api/wallets/transfer               — העבר USDC בין ארנקים
-GET    /api/wallets/{wallet_id}/balance    — רענן יתרה
+GET    /api/wallets/{user_id}                      — כל הארנקים של משתמש + יתרות
+POST   /api/wallets/{user_id}/create               — צור ארנק חדש
+PATCH  /api/wallets/{wallet_id}/label              — שנה שם ארנק
+PATCH  /api/wallets/{wallet_id}/set-default        — קבע ברירת מחדל
+POST   /api/wallets/transfer                       — העבר USDC בין ארנקים
+GET    /api/wallets/{wallet_id}/balance            — רענן יתרה
+GET    /api/wallets/{wallet_id}/approval-status    — בדוק אישורי חוזי Polymarket
+POST   /api/wallets/{wallet_id}/approve-polymarket — אשר חוזי Polymarket (חד-פעמי)
 """
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -17,7 +19,8 @@ from db import get_db
 from models.wallet import Wallet
 from models.copy_settings import User
 from services.wallet_service import (
-    create_wallet, get_all_balances, transfer_usdc
+    create_wallet, get_all_balances, transfer_usdc,
+    approve_polymarket_contracts, check_polymarket_approval,
 )
 from datetime import datetime, timezone
 
@@ -222,6 +225,50 @@ def transfer_between_wallets(req: TransferRequest, db: Session = Depends(get_db)
         "amount_usdc": req.amount_usdc,
         "from_new_balance": round(from_w.cached_usdc_balance, 2),
         "to_new_balance":   round(to_w.cached_usdc_balance,   2),
+    }
+
+
+@router.get("/{wallet_id}/approval-status")
+async def get_approval_status(wallet_id: int, db: Session = Depends(get_db)):
+    """
+    בדיקה (read-only) — האם הארנק כבר אישר את חוזי Polymarket.
+    אינו מוציא gas. מחזיר {ready: bool, ...} לכל חוזה.
+    """
+    w = db.query(Wallet).filter(Wallet.id == wallet_id).first()
+    if not w:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    result = await check_polymarket_approval(w.address)
+    return {**result, "wallet_address": w.address, "wallet_id": wallet_id}
+
+
+@router.post("/{wallet_id}/approve-polymarket")
+async def approve_polymarket(wallet_id: int, db: Session = Depends(get_db)):
+    """
+    אישור חד-פעמי של כל חוזי Polymarket — נדרש לפני טריידינג אמיתי.
+    מבצע עד 5 טרנזקציות Polygon. עלות: ~0.005-0.02 MATIC.
+    חוזים שכבר אושרו — מדולגים (ללא gas).
+    """
+    w = db.query(Wallet).filter(Wallet.id == wallet_id).first()
+    if not w:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    if not w.encrypted_private_key:
+        raise HTTPException(status_code=400, detail="אין מפתח פרטי לארנק זה")
+
+    # Check MATIC balance first — need at least 0.005 MATIC for gas
+    from services.wallet_service import get_matic_balance
+    matic = get_matic_balance(w.address)
+    if matic < 0.005:
+        raise HTTPException(
+            status_code=400,
+            detail=f"יתרת MATIC לא מספיקה לעמלות gas. יתרה: {matic:.4f} MATIC. נדרש: לפחות 0.005 MATIC."
+        )
+
+    result = await approve_polymarket_contracts(w.address, w.encrypted_private_key)
+    return {
+        **result,
+        "wallet_address": w.address,
+        "wallet_id":      wallet_id,
+        "matic_used":     matic - get_matic_balance(w.address),
     }
 
 
