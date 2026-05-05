@@ -46,9 +46,27 @@ app.include_router(smart_money.router,      prefix="/api/smart-money",      tags
 async def startup():
     from db import create_tables
     create_tables()
+    _run_migrations()
     _ensure_default_user()
     from services.copy_engine import copy_engine
     await copy_engine.start()
+
+
+def _run_migrations():
+    """Lightweight incremental migrations for columns added after initial deploy."""
+    from db import engine
+    try:
+        with engine.connect() as conn:
+            # v3.5: add token_id to copy_trades for accurate CLOB price lookups
+            conn.execute(
+                __import__("sqlalchemy").text(
+                    "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS token_id VARCHAR"
+                )
+            )
+            conn.commit()
+    except Exception as e:
+        # SQLite or column already exists — safe to ignore
+        pass
 
 
 def _ensure_default_user():

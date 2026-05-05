@@ -219,6 +219,7 @@ class CopyEngine:
                 copy_settings_id=setting.id,
                 trader_address=setting.trader_address,
                 market_id=condition_id,
+                token_id=token_id or None,   # store YES/NO token_id for accurate CLOB price lookups
                 market_question=market_title,
                 side=our_side,
                 amount_usdc=copy_size,
@@ -347,7 +348,10 @@ class CopyEngine:
                             continue
                         cur_price = pos_info.get("cur_price") if pos_info else None
                         if cur_price is None:
-                            cur_price = await self._get_price(client, trade.market_id)
+                            # Use stored token_id for accurate CLOB midpoint lookup;
+                            # fall back to conditionId (less reliable but better than nothing)
+                            price_lookup_id = trade.token_id or trade.market_id
+                            cur_price = await self._get_price(client, price_lookup_id)
                         if cur_price is None:
                             continue
 

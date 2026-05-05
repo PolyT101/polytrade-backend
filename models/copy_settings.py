@@ -81,7 +81,8 @@ class CopyTrade(Base):
     user_id            = Column(String, ForeignKey("users.id"))
     copy_settings_id   = Column(Integer, ForeignKey("copy_settings.id"), nullable=True)
     trader_address     = Column(String)
-    market_id          = Column(String)
+    market_id          = Column(String)   # conditionId — market identifier
+    token_id           = Column(String, nullable=True)  # YES/NO token id for CLOB price lookups
     market_question    = Column(String, nullable=True)
     side               = Column(String)   # YES | NO
     amount_usdc        = Column(Float)
