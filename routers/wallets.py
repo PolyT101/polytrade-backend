@@ -47,6 +47,15 @@ class LabelRequest(BaseModel):
     label: str
 
 
+class BackupExportRequest(BaseModel):
+    password: str  # סיסמה לגיבוי — לא נשמרת בשרת, רק לגזירת מפתח AES
+
+
+class BackupImportRequest(BaseModel):
+    password: str
+    backup:   dict  # הקובץ המוצפן כ-JSON
+
+
 # ------------------------------------------------------------------ #
 #  Endpoints                                                           #
 # ------------------------------------------------------------------ #
@@ -291,4 +300,111 @@ def refresh_balance(wallet_id: int, db: Session = Depends(get_db)):
         "usdc_balance": w.cached_usdc_balance,
         "matic_balance": w.cached_matic_balance,
         "updated_at":   w.balance_updated_at.isoformat(),
+    }
+
+
+# ------------------------------------------------------------------ #
+#  Encrypted Backup / Restore                                          #
+# ------------------------------------------------------------------ #
+
+@router.post("/{user_id}/export-backup")
+def export_backup(user_id: str, req: BackupExportRequest, db: Session = Depends(get_db)):
+    """
+    מייצא גיבוי מוצפן של כל הארנקים.
+    ההצפנה: AES-256-GCM + PBKDF2-SHA256 (200K iterations).
+    הסיסמה לא נשמרת בשרת — רק המשתמש יודע אותה.
+    הקובץ המוצפן בטוח לשמירה בכל מקום, כולל GitHub ציבורי.
+    """
+    if len(req.password) < 8:
+        raise HTTPException(status_code=400, detail="סיסמה חייבת להיות לפחות 8 תווים")
+
+    ws = db.query(Wallet).filter(Wallet.user_id == user_id).all()
+    if not ws:
+        raise HTTPException(status_code=404, detail="אין ארנקים לייצוא")
+
+    from services.wallet_service import decrypt_private_key
+    from services.wallet_backup  import encrypt_backup
+
+    wallet_data = []
+    for w in ws:
+        pk = None
+        if w.encrypted_private_key:
+            try:
+                pk = decrypt_private_key(w.encrypted_private_key)
+            except Exception:
+                pk = None   # ארנק ללא מפתח (ארנק חיצוני) — מייצא כתובת בלבד
+        wallet_data.append({
+            "address":    w.address,
+            "private_key": pk,
+            "label":      w.label,
+            "is_default": w.is_default,
+        })
+
+    encrypted = encrypt_backup(wallet_data, req.password)
+    encrypted["exported_at"]   = datetime.now(timezone.utc).isoformat()
+    encrypted["wallet_count"]  = len(wallet_data)
+    # user_id מוסף כמידע בלבד (לא חלק מהנתונים המוצפנים)
+    encrypted["hint_user_id"]  = user_id
+
+    return encrypted
+
+
+@router.post("/{user_id}/import-backup")
+def import_backup(user_id: str, req: BackupImportRequest, db: Session = Depends(get_db)):
+    """
+    משחזר ארנקים מגיבוי מוצפן.
+    ארנקים שכבר קיימים (לפי כתובת) — מדולגים.
+    ארנקים חדשים — נוצרים עם ה-private key המשוחזר.
+    """
+    from services.wallet_backup  import decrypt_backup
+    from services.wallet_service import encrypt_private_key
+    from cryptography.exceptions import InvalidTag
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        wallet_data = decrypt_backup(req.backup, req.password)
+    except (InvalidTag, ValueError):
+        raise HTTPException(status_code=400, detail="סיסמה שגויה או קובץ גיבוי פגום")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"שגיאה בפענוח: {str(e)}")
+
+    results   = []
+    restored  = 0
+
+    for item in wallet_data:
+        addr = item.get("address", "")
+        if not addr:
+            continue
+
+        existing = db.query(Wallet).filter(Wallet.address == addr).first()
+        if existing:
+            results.append({"address": addr, "status": "already_exists", "label": item.get("label")})
+            continue
+
+        pk = item.get("private_key")
+        if not pk:
+            results.append({"address": addr, "status": "no_key_skipped", "label": item.get("label")})
+            continue
+
+        w = Wallet(
+            user_id=user_id,
+            address=addr,
+            encrypted_private_key=encrypt_private_key(pk),
+            label=item.get("label", "ארנק משוחזר"),
+            is_default=item.get("is_default", False),
+            cached_usdc_balance=0.0,
+        )
+        db.add(w)
+        results.append({"address": addr, "status": "restored", "label": item.get("label")})
+        restored += 1
+
+    db.commit()
+    return {
+        "success":  True,
+        "restored": restored,
+        "skipped":  len(results) - restored,
+        "details":  results,
     }
